@@ -1,0 +1,21 @@
+# Game data, dumps and anything generated from them
+private/
+*.iso
+*.xex
+*.god
+*.module
+
+# Fetched sources, toolchains and build output
+upstream/
+.deps/
+build/
+dist/
+release/
+
+# Local evidence, logs and secrets
+evidence/
+logs/
+*.log
+.env
+.env.*
+__pycache__/

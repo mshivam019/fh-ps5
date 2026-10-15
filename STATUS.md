@@ -257,25 +257,31 @@ without those debug sections. Keep the matching ELF when collecting addresses.
 
 Create `/app0/trace.enable` before launch to enable the diagnostic capture.
 Without the marker, tracing stays disabled. The capture writes
-`/app0/logs/frame-trace.bin` on a background thread every two seconds. Producers
-reserve fixed slots without allocation, file writes or waiting. Capture stops
-at ten minutes or 65,536 events; kernel messages report capacity drops and write
-errors. A new diagnostic launch replaces the previous binary capture, so
-download it first. Removing the marker disables capture on the next launch.
+`/app0/logs/frame-trace.bin` on a background thread with 100 ms drain intervals.
+The reusable queue holds 4,096 records. Producers try a short queue lock and
+drop rather than wait on contention or saturation; the writer copies bounded
+batches and releases the lock before file I/O. Capture stops at ten minutes or
+64 MiB, not after a lifetime event count. Every two seconds, a binary health
+record reports cumulative dropped events. Kernel messages report write errors.
+A new diagnostic launch replaces the previous binary capture, so download it
+first. Removing the marker disables capture on the next launch.
 
 Events cover GPU swap arrival, mailbox publication and acquisition, paced UI
 requests, UI paint boundaries, native flip submission and observed completion.
 Spans over two milliseconds cover command starvation, blocking submission-fence
 checks, swap submission, swap processing and host-file reads with paths and
-requested byte counts. These do not measure decompression, every guest wait,
-CPU scheduling or GPU execution duration directly. Do not infer those causes
-from missing events.
+requested byte counts. Exclusive per-frame wall-time categories cover command
+dispatch, empty-command-ring waits, register waits, blocking fence checks,
+swap work, swap submission and remaining worker time. Nested waits are
+subtracted from their parent category; all waits count, even under two
+milliseconds. Wall time includes OS descheduling. These categories do not
+directly measure CPU utilization, decompression, every guest wait or GPU execution.
 
 Download the binary over FTP and decode locally:
 
 ```sh
 python3 tools/frame-trace.py build/console/frame-trace.bin \
-  --json build/console/frame-trace-report.json
+  --after-seconds RACE_START_SECONDS --json build/console/frame-trace-report.json
 ```
 
 The report correlates distinct-image gaps over 45 ms with publication,
@@ -283,15 +289,17 @@ acquisition, native submission and completion observations. Overlapping slow
 reads/waits are evidence of temporal overlap, not proof of causality.
 The decoder ignores an incomplete final record when reading a live download.
 
-Local verification: four concurrent producers submitted 80,000 events.
-The capture preserved 65,536 intact unique events, reported 14,464 drops, and
-reported no write error under AddressSanitizer and UndefinedBehaviorSanitizer.
-Disabled capture created no output. A deterministic correlation scenario
-verified frame timing, slow-read overlap and partial-final-record decoding.
-The native display bridge sanitizer regression also passes.
+Local verification: `ps5/tests/trace_queue.cpp` covers empty/saturated queues,
+FIFO wraparound beyond 65,536 records, concurrent integrity and exact drop
+accounting under AddressSanitizer and UndefinedBehaviorSanitizer.
+`ps5/tests/trace_decoder.py` checks exclusive totals versus contiguous spans,
+race cutoffs, incomplete frame categories, health counters and partial records.
+An actual writer smoke preserved 160,000 unique events with zero drops across
+buffer reuse and 80 complete nested wall-time snapshots.
 
-The console diagnostic executable preserves the previous working executable as
-`eboot.bin.before-frame-diagnostics-20261015-201643`. Saves, graphics settings,
+The sustained diagnostic executable preserves the previous executable as
+`eboot.bin.before-sustained-race-diagnostics-20261015-203944`. Its matching local
+symbols are `build/console/sustained-race-symbols.elf`. Saves, graphics settings,
 thumbnail readbacks and shader caches are unchanged.
 
 ### First diagnostic findings
@@ -394,3 +402,47 @@ The remaining unclassified time includes CPU command processing, guest
 scheduling and waits shorter than the span threshold. The next diagnostic
 slice must attribute time between command processing and guest synchronization,
 not repeat file-cache changes or claim that all stutters are fixed.
+
+### Sustained attribution race procedure
+
+1. Keep the same race, car, graphics settings and shader cache for comparison.
+2. Launch the diagnostic build with `trace.enable` present. Tell the operator
+   when the race starts so a capture-relative cutoff can be saved.
+3. Race normally and report hitches. The operator must not restart the title
+   during the race. Download the binary before the next diagnostic launch.
+4. Decode with `--after-seconds` from the saved race marker. Inspect the latest
+   dropped-event count and each frame's `complete` flag before attribution.
+   Incomplete frame totals must not be interpreted as a complete timing budget.
+5. Compare publication/delivery gaps with exclusive command-frame categories.
+   Dispatch time excludes instrumented nested register, fence and swap work,
+   but still includes OS descheduling and uninstrumented operations. Temporal
+   overlap and wall-time totals do not establish CPU saturation.
+
+The user started the sustained diagnostic race at an observed trace elapsed
+104.054 seconds. `build/console/sustained-race-start-marker.json` records the
+boundary; boot/title events before it are excluded from race analysis. At the
+boundary, the capture contains 54,273 events and 3,093 complete seven-category
+frame snapshots. The latest health record reports two dropped events in the
+startup segment. The game and diagnostic settings remain unchanged during
+the race.
+
+Live console verification passed the previous lifetime limit: the snapshot at
+176.192 seconds contains 92,572 events. After the 104.054-second race cutoff,
+the report includes 38,299 events and zero repeated-image completions.
+The latest health record reports three dropped events total versus two at the
+race-start boundary. Reported frame examples below have all seven categories.
+Evidence: `build/console/sustained-race-live-trace.bin` and
+`build/console/sustained-race-live-report.json`.
+
+One 83.323 ms command-frame interval contains 73.344 ms of dispatch, 5.068 ms
+of register waits, 0.644 ms of empty-ring waits, 0.009 ms of blocking fence
+checks, 3.860 ms of swap work and 0.390 ms of swap submission. It precedes
+an 83.406 ms distinct-image gap; the image's publication-to-acquisition delay
+is 0.800 ms. Another 67.759 ms interval has 63.389 ms of dispatch.
+
+The largest remaining sampled race hitches are dominated by dispatch wall time,
+not the measured nested register/fence waits or empty-ring waits. This narrows
+the next diagnostic slice to operations inside dispatch versus OS descheduling.
+It does not yet identify a particular texture, draw or resource operation,
+and does not establish CPU saturation. Keep the current race build unchanged
+until the user completes the comparison run.

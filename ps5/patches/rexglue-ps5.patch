@@ -79,10 +79,10 @@ index d876846..0dee191 100644
  struct clock_time_conversion {};
 diff --git a/include/rex/diagnostic_trace.h b/include/rex/diagnostic_trace.h
 new file mode 100644
-index 0000000..1548471
+index 0000000..41dc8c6
 --- /dev/null
 +++ b/include/rex/diagnostic_trace.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,76 @@
 +#pragma once
 +#include <rex/platform.h>
 +#include <cstdint>
@@ -98,6 +98,47 @@ index 0000000..1548471
 +}
 +inline void Event(uint32_t stage, uint64_t id = 0, uint64_t argument = 0) {
 +  if (rex_ps5_trace_enabled()) rex_ps5_trace(stage, id, argument, 0, nullptr);
++}
++// Exclusive wall-time accounting on the command worker. It includes any OS
++// descheduling inside a category; it is not a measurement of CPU utilization.
++struct FrameTimes {
++  uint64_t totals[7] = {};
++  uint64_t last = Now();
++  unsigned category = 0;
++  void Account() {
++    const uint64_t time = Now();
++    totals[category] += time - last;
++    last = time;
++  }
++};
++inline thread_local FrameTimes frame_times;
++class Activity {
++ public:
++  explicit Activity(unsigned category, bool active = true)
++      : enabled_(active && rex_ps5_trace_enabled()), previous_(0) {
++    if (enabled_) {
++      frame_times.Account();
++      previous_ = frame_times.category;
++      frame_times.category = category;
++    }
++  }
++  ~Activity() {
++    if (enabled_) {
++      frame_times.Account();
++      frame_times.category = previous_;
++    }
++  }
++ private:
++  bool enabled_;
++  unsigned previous_;
++};
++inline void Frame(uint64_t id) {
++  if (!rex_ps5_trace_enabled()) return;
++  frame_times.Account();
++  for (unsigned category = 0; category < 7; ++category) {
++    rex_ps5_trace(20 + category, id, 0, frame_times.totals[category], nullptr);
++    frame_times.totals[category] = 0;
++  }
 +}
 +class SlowScope {
 + public:
@@ -1913,7 +1954,7 @@ index da7ae1a..f865d2c 100644
  
  set_target_properties(rexgpu-xenos PROPERTIES
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 7892600..58ea373 100644
+index 7892600..8911510 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,6 +10,7 @@
@@ -1964,7 +2005,14 @@ index 7892600..58ea373 100644
  void CommandProcessor::WorkerThreadMain() {
    if (!SetupContext()) {
      rex::FatalError("Unable to setup command processor internal state");
-@@ -225,6 +245,9 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -221,10 +241,16 @@ void CommandProcessor::WorkerThreadMain() {
+     uint32_t write_ptr_index = write_ptr_index_.load();
+     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
++      #if REX_PLATFORM_PS5
++      rex::diagnostic::Activity idle_activity(2);
++      #endif
+       // We've run out of commands to execute.
        // We spin here waiting for new ones, as the overhead of waiting on our
        // event is too high.
        PrepareForWait();
@@ -1974,7 +2022,7 @@ index 7892600..58ea373 100644
        uint32_t loop_count = 0;
        do {
          // If we spin around too much, revert to a "low-power" state.
-@@ -240,6 +263,18 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -240,6 +266,18 @@ void CommandProcessor::WorkerThreadMain() {
        } while (worker_running_ && pending_fns_.empty() &&
                 (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
        ReturnFromWait();
@@ -1993,11 +2041,26 @@ index 7892600..58ea373 100644
        if (!worker_running_ || !pending_fns_.empty()) {
          continue;
        }
-@@ -1021,6 +1056,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -247,7 +285,12 @@ void CommandProcessor::WorkerThreadMain() {
+     assert_true(read_ptr_index_ != write_ptr_index);
+ 
+     // Execute. Note that we handle wraparound transparently.
+-    read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    {
++      #if REX_PLATFORM_PS5
++      rex::diagnostic::Activity dispatch_activity(1);
++      #endif
++      read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    }
+ 
+     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+     //     that many indices.
+@@ -1021,6 +1064,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
    uint32_t ref = reader->ReadAndSwap<uint32_t>();
    uint32_t mask = reader->ReadAndSwap<uint32_t>();
    uint32_t wait = reader->ReadAndSwap<uint32_t>();
 +  #if REX_PLATFORM_PS5
++  rex::diagnostic::Activity register_activity(3);
 +  rex::diagnostic::SlowScope register_wait_trace(
 +      16, poll_reg_addr, (uint64_t(wait_info) << 32) | wait);
 +  #endif
@@ -2463,7 +2526,7 @@ index 25fca71..7a2c4d3 100644
  
    return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 24abe85..5e3a6be 100644
+index 24abe85..0ac0e1b 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -1,3 +1,4 @@
@@ -2703,18 +2766,20 @@ index 24abe85..5e3a6be 100644
    uint32_t end_index = start_index + num_registers - 1;
  
    auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,
-@@ -2561,6 +2666,10 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -2561,6 +2666,12 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
  
  void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                         uint32_t frontbuffer_height) {
 +#if REX_PLATFORM_PS5
++  rex::diagnostic::Frame(counter_);
++  rex::diagnostic::Activity swap_activity(5);
 +  rex::diagnostic::Event(1, counter_);
 +  rex::diagnostic::SlowScope swap_trace(2, counter_);
 +#endif
    SCOPE_profile_cpu_f("gpu");
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
-@@ -2582,6 +2691,45 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2582,6 +2693,45 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
    bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                              REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                              frame_used_async_placeholder_pipeline_;
@@ -2760,7 +2825,7 @@ index 24abe85..5e3a6be 100644
    if (skip_present_due_async_placeholder) {
      static bool skipped_incomplete_frame_logged = false;
      if (!skipped_incomplete_frame_logged) {
-@@ -3950,6 +4098,9 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+@@ -3950,6 +4100,9 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
  bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                         IndexBufferInfo* index_buffer_info,
                                         bool major_mode_explicit) {
@@ -2770,7 +2835,7 @@ index 24abe85..5e3a6be 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -4068,7 +4219,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4068,7 +4221,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      }
  
      // Process primitives.
@@ -2785,7 +2850,7 @@ index 24abe85..5e3a6be 100644
        return draw_fail("primitive_processing");
      }
      if (!primitive_processing_result.host_draw_vertex_count) {
-@@ -4195,12 +4352,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4195,12 +4354,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    uint32_t used_texture_mask =
        vertex_shader->GetUsedTextureMaskAfterTranslation() |
        (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
@@ -2810,7 +2875,7 @@ index 24abe85..5e3a6be 100644
      return draw_fail("render_target_update");
    }
  
-@@ -4209,11 +4376,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4209,11 +4378,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // textures.
    VkPipeline pipeline;
    void* pipeline_handle = nullptr;
@@ -2832,7 +2897,7 @@ index 24abe85..5e3a6be 100644
      return draw_fail("configure_pipeline");
    }
    bool pipeline_is_placeholder = false;
-@@ -4254,6 +4426,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4254,6 +4428,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          descriptor_sets_kept = std::min(
              descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
        }
@@ -2841,7 +2906,7 @@ index 24abe85..5e3a6be 100644
      } else {
        // No or unknown pipeline layout previously bound - all bindings are in an
        // indeterminate state.
-@@ -4285,6 +4459,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4285,6 +4461,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // life. Or even disregard the viewport bounds range in the fragment shader
    // interlocks case completely - apply the viewport and the scissor offset
    // directly to pixel address and to things like ps_param_gen.
@@ -2852,7 +2917,7 @@ index 24abe85..5e3a6be 100644
    draw_util::GetHostViewportInfo(
        regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
        device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
-@@ -4294,6 +4472,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4294,6 +4474,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
  
    // Update dynamic graphics pipeline state.
    UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
@@ -2860,7 +2925,7 @@ index 24abe85..5e3a6be 100644
  
    auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
  
-@@ -4327,20 +4506,37 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4327,20 +4508,37 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    }
  
    // Update system constants before uploading them.
@@ -2903,7 +2968,7 @@ index 24abe85..5e3a6be 100644
      uint32_t j;
      while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
        vfetch_bits_remaining &= ~(uint32_t(1) << j);
-@@ -4386,6 +4582,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4386,6 +4584,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
      }
    }
@@ -2911,7 +2976,7 @@ index 24abe85..5e3a6be 100644
  
    // Synchronize the memory pages backing memory scatter export streams, and
    // calculate the range that includes the streams for the buffer barrier.
-@@ -4555,8 +4752,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4555,8 +4754,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
    }
  
@@ -2923,7 +2988,7 @@ index 24abe85..5e3a6be 100644
      uint32_t memexport_total_size = 0;
      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
        memexport_total_size += memexport_range.size_bytes;
-@@ -4780,7 +4978,7 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4780,7 +4980,7 @@ bool VulkanCommandProcessor::IssueCopy() {
    }
  
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
@@ -2932,7 +2997,7 @@ index 24abe85..5e3a6be 100644
      uint32_t written_address, written_length;
      return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                           written_address, written_length);
-@@ -4810,7 +5008,23 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -4810,7 +5010,23 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
  
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
@@ -2957,11 +3022,12 @@ index 24abe85..5e3a6be 100644
    }
  
    auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
-@@ -5334,6 +5548,13 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
+@@ -5334,6 +5550,14 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
  }
  
  void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
 +#if REX_PLATFORM_PS5
++  rex::diagnostic::Activity fence_activity(4, await_submission != 0);
 +  rex::diagnostic::SlowScope fence_trace(8, await_submission, submission_completed_,
 +                                        nullptr, await_submission != 0);
 +#endif
@@ -2971,7 +3037,7 @@ index 24abe85..5e3a6be 100644
    // Only report once, no need to retry a wait that won't succeed anyway.
    if (device_lost_) {
      return;
-@@ -5376,13 +5597,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5376,13 +5600,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
    }
    if (await_submission > submission_completed_) {
      // Await in a blocking way if requested.
@@ -2991,7 +3057,7 @@ index 24abe85..5e3a6be 100644
      if (wait_result == VK_SUCCESS) {
        fences_awaited += await_submission - submission_completed_;
      } else {
-@@ -5397,7 +5618,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5397,7 +5621,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
    // that for simplicity.
    while (fences_awaited < fences_total) {
      VkResult fence_status =
@@ -3000,11 +3066,12 @@ index 24abe85..5e3a6be 100644
      if (fence_status != VK_SUCCESS) {
        if (fence_status == VK_ERROR_DEVICE_LOST) {
          device_lost_ = true;
-@@ -5641,6 +5862,15 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5641,6 +5865,16 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
  }
  
  bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 +#if REX_PLATFORM_PS5
++  rex::diagnostic::Activity submission_activity(6, is_swap);
 +  rex::diagnostic::SlowScope submit_trace(9, GetCurrentSubmission(), is_swap, nullptr, is_swap);
 +#endif
 +  // Never reuse descriptors across submission/resource-reclamation boundaries.
@@ -3016,7 +3083,7 @@ index 24abe85..5e3a6be 100644
    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
-@@ -5885,6 +6115,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5885,6 +6119,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
    if (is_closing_frame) {
      if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
        shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
@@ -3025,7 +3092,7 @@ index 24abe85..5e3a6be 100644
      }
      frame_open_ = false;
      // Submission already closed now, so minus 1.
-@@ -5926,6 +6158,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5926,6 +6162,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
    return true;
  }
  
@@ -3033,7 +3100,7 @@ index 24abe85..5e3a6be 100644
  void VulkanCommandProcessor::ClearTransientDescriptorPools() {
    texture_transient_descriptor_sets_free_.clear();
    texture_transient_descriptor_sets_used_.clear();
-@@ -5940,6 +6173,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
+@@ -5940,6 +6177,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
    single_transient_descriptors_used_.clear();
    transient_descriptor_allocator_storage_buffer_.Reset();
    transient_descriptor_allocator_uniform_buffer_.Reset();
@@ -3041,7 +3108,7 @@ index 24abe85..5e3a6be 100644
  }
  
  void VulkanCommandProcessor::SplitPendingBarrier() {
-@@ -6797,6 +7031,23 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+@@ -6797,6 +7035,23 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
    }
  }
  
@@ -3065,7 +3132,7 @@ index 24abe85..5e3a6be 100644
  bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                              const VulkanShader* pixel_shader) {
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -6804,6 +7055,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6804,6 +7059,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
  
    const RegisterFile& regs = *register_file_;
@@ -3075,7 +3142,7 @@ index 24abe85..5e3a6be 100644
  
    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-@@ -6896,18 +7150,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6896,18 +7154,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
          return false;
        }
        buffer_info.range = VkDeviceSize(float_constants_size);
@@ -3096,7 +3163,7 @@ index 24abe85..5e3a6be 100644
        current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                                << SpirvShaderTranslator::kConstantBufferFloatVertex;
      }
-@@ -6925,18 +7169,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6925,18 +7173,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
          return false;
        }
        buffer_info.range = VkDeviceSize(float_constants_size);
@@ -3117,7 +3184,7 @@ index 24abe85..5e3a6be 100644
        current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                                << SpirvShaderTranslator::kConstantBufferFloatPixel;
      }
-@@ -6976,6 +7210,34 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6976,6 +7214,34 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
  
@@ -3152,7 +3219,7 @@ index 24abe85..5e3a6be 100644
    // Textures and samplers.
    const std::vector<VulkanShader::SamplerBinding>& samplers_vertex =
        vertex_shader->GetSamplerBindingsAfterTranslation();
-@@ -6997,10 +7259,36 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6997,10 +7263,36 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      sampler_count_pixel = 0;
      texture_count_pixel = 0;
    }
@@ -3193,7 +3260,7 @@ index 24abe85..5e3a6be 100644
  
    // Make sure new descriptor sets are bound to the command buffer.
  
-@@ -7062,6 +7350,30 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -7062,6 +7354,30 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
  
@@ -3224,7 +3291,7 @@ index 24abe85..5e3a6be 100644
    // Write the new descriptor sets.
  
    // Consecutive bindings updated via a single VkWriteDescriptorSet must have
-@@ -7082,9 +7394,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -7082,9 +7398,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
        constants_transient_descriptors_free_.pop_back();
      } else {
        VkDescriptorPoolSize constants_descriptor_count;
@@ -3236,7 +3303,7 @@ index 24abe85..5e3a6be 100644
            descriptor_set_layout_constants_, &constants_descriptor_count, 1);
        if (constants_descriptor_set == VK_NULL_HANDLE) {
          return false;
-@@ -7101,9 +7413,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -7101,9 +7417,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
        write_constants.dstBinding = i;
        write_constants.dstArrayElement = 0;
        write_constants.descriptorCount = 1;
@@ -3248,7 +3315,7 @@ index 24abe85..5e3a6be 100644
        write_constants.pTexelBufferView = nullptr;
      }
      write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
-@@ -7167,11 +7479,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -7167,11 +7483,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
    while (rex::bit_scan_forward(descriptor_sets_remaining, &descriptor_set_index)) {
      uint32_t descriptor_set_mask_tzcnt =
          rex::tzcnt(~(descriptor_sets_remaining | ((UINT32_C(1) << descriptor_set_index) - 1)));

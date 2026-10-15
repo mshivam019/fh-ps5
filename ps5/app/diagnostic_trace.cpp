@@ -1,5 +1,5 @@
-// Bounded append-only capture. Producers never allocate, wait, or write files.
-#include <algorithm>
+// Bounded reusable capture. Producers never allocate, wait, or write files.
+#include "diagnostic_trace_queue.h"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -7,21 +7,11 @@
 #include <cstring>
 #include <thread>
 #include <pthread.h>
-#include <sys/stat.h>
 
 namespace {
-constexpr uint32_t kCapacity = 65536;
-struct Event {
-  uint64_t timestamp, duration, id, argument, thread;
-  uint32_t stage;
-  char path[116];
-};
-static_assert(sizeof(Event) == 160);
-struct Slot { Event event; std::atomic<bool> ready{false}; };
-Slot slots[kCapacity];
-std::atomic<uint32_t> reserved{0};
+using diagnostic_trace::Event;
+diagnostic_trace::Queue queue;
 std::atomic<bool> enabled{false};
-std::atomic<uint64_t> dropped{0};
 uint64_t now() {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -31,17 +21,15 @@ extern "C" bool rex_ps5_trace_enabled() { return enabled.load(std::memory_order_
 extern "C" void rex_ps5_trace(uint32_t stage, uint64_t id, uint64_t argument,
                                uint64_t duration_ns, const char* path) {
   if (!rex_ps5_trace_enabled()) return;
-  const uint32_t index = reserved.fetch_add(1, std::memory_order_relaxed);
-  if (index >= kCapacity) { dropped.fetch_add(1, std::memory_order_relaxed); return; }
-  auto& slot = slots[index];
-  auto& event = slot.event;
+  Event event;
   event.timestamp = now(); event.duration = duration_ns; event.id = id;
   event.argument = argument; event.thread = (uint64_t)pthread_self(); event.stage = stage;
+  memset(event.path, 0, sizeof(event.path));
   if (path) {
     const size_t length = strnlen(path, sizeof(event.path) - 1);
-    memcpy(event.path, path, length); event.path[length] = 0;
+    memcpy(event.path, path, length);
   }
-  slot.ready.store(true, std::memory_order_release);
+  queue.Push(event);
 }
 void StartDiagnosticTrace(const char* marker_path, const char* output_path) {
   FILE* marker = fopen(marker_path, "rb");
@@ -54,22 +42,44 @@ void StartDiagnosticTrace(const char* marker_path, const char* output_path) {
   fflush(output);
   enabled.store(true, std::memory_order_release);
   std::thread([output] {
-    uint32_t consumed = 0;
+    constexpr uint64_t kMaxEvents = (64 * 1024 * 1024 - 8) / sizeof(Event);
+    Event batch[128];
+    uint64_t written = 0;
     bool failed = false;
-    const auto end = std::chrono::steady_clock::now() + std::chrono::minutes(10);
-    fprintf(stderr, "[frame trace] enabled: 10 minutes, capacity=%u events, record_bytes=%zu\n", kCapacity, sizeof(Event));
-    while (std::chrono::steady_clock::now() < end && consumed < kCapacity && !failed) {
-      std::this_thread::sleep_for(std::chrono::seconds(2));
-      const uint32_t limit = std::min(reserved.load(std::memory_order_acquire), kCapacity);
-      while (consumed < limit && slots[consumed].ready.load(std::memory_order_acquire)) {
-        if (fwrite(&slots[consumed].event, sizeof(Event), 1, output) != 1) { failed = true; break; }
-        ++consumed;
+    auto next_health = std::chrono::steady_clock::now();
+    const auto end = next_health + std::chrono::minutes(10);
+    fprintf(stderr, "[frame trace] enabled: reusable_queue=%zu events, max_file=64MiB, duration=10min\n",
+            diagnostic_trace::Queue::kCapacity);
+    while (std::chrono::steady_clock::now() < end && written + 2 < kMaxEvents && !failed) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      size_t count;
+      // Limit work per drain cycle so a producer flood cannot starve this thread.
+      for (unsigned batches = 0; batches < 32; ++batches) {
+        const size_t room = size_t(kMaxEvents - written - 2);
+        count = queue.Drain(batch, room < 128 ? room : 128);
+        if (!count) break;
+        if (fwrite(batch, sizeof(Event), count, output) != count) { failed = true; break; }
+        written += count;
+      }
+      const auto time = std::chrono::steady_clock::now();
+      if (time >= next_health && !failed) {
+        Event health{};
+        health.timestamp = now(); health.stage = 17;
+        health.id = queue.dropped(); health.argument = written;
+        if (fwrite(&health, sizeof(health), 1, output) != 1) failed = true;
+        else ++written;
+        next_health = time + std::chrono::seconds(2);
       }
       if (fflush(output) != 0) failed = true;
     }
     enabled.store(false, std::memory_order_release);
+    // Always attempt a final health record; room is reserved above.
+    Event health{};
+    health.timestamp = now(); health.stage = 17;
+    health.id = queue.dropped(); health.argument = written;
+    if (fwrite(&health, sizeof(health), 1, output) != 1 || fflush(output) != 0) failed = true;
     fclose(output);
-    fprintf(stderr, "[frame trace] stopped: written=%u dropped=%llu write_failed=%d\n",
-            consumed, (unsigned long long)dropped.load(), int(failed));
+    fprintf(stderr, "[frame trace] stopped: written=%llu dropped=%llu write_failed=%d\n",
+            (unsigned long long)written, (unsigned long long)queue.dropped(), int(failed));
   }).detach();
 }

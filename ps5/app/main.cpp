@@ -12,6 +12,7 @@
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
 #include <rex/ui/windowed_app_context_sdl.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -103,6 +104,13 @@ static bool check_fibers() {
 }
 
 int main() {
+    // RADV keeps its shader cache in a database of 50 parts by default, with
+    // two open files per part. Once Forza's cache filled enough parts, fopen
+    // failed with EMFILE at 265 open descriptors (RLIMIT_NOFILE says 13952):
+    // the shader storage and the game's cache: drive could not open, and the
+    // game showed a disc read error. Four parts keep RADV to a few files. Set
+    // before the GPU starts.
+    setenv("MESA_DISK_CACHE_DATABASE_NUM_PARTS", "4", 0);
     platform_init("Forza Horizon");
     if (!check_fibers()) return 1;
     // The game code is a private module prepared by the desktop setup; load it

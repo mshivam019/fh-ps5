@@ -630,7 +630,7 @@ index 352af67..5679e81 100644
    void (*entry_)(void*) = nullptr;
    void* arg_ = nullptr;
 diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
-index afb4a30..dff8735 100644
+index afb4a30..20b20a7 100644
 --- a/include/rex/ui/presenter.h
 +++ b/include/rex/ui/presenter.h
 @@ -716,6 +716,10 @@ class Presenter {
@@ -644,7 +644,7 @@ index afb4a30..dff8735 100644
    // For calling from the painting implementations if requested.
    void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
  
-@@ -977,6 +981,31 @@ class Presenter {
+@@ -977,6 +981,34 @@ class Presenter {
    // rather than being blank.
    bool guest_output_active_last_refresh_ = false;
  
@@ -668,9 +668,12 @@ index afb4a30..dff8735 100644
 +  // acquired image instead of taking a newer ready one.
 +  bool consume_hold_ = false;
 +#if REX_PLATFORM_PS5
-+  // UI redraws may continue independently. Only a paced request may acquire
-+  // a new guest image; other redraws retain the current mailbox image.
++  // Only the paced UI request may paint; independent UI ticks cannot queue
++  // copies of the held image into the VideoOut FIFO.
 +  std::atomic<bool> frame_pacing_consume_pending_{false};
++  uint64_t frame_pacing_image_sequence_[3] = {};
++  uint64_t frame_pacing_next_image_ = 0;
++  std::atomic<uint64_t> frame_pacing_acquired_image_{0};
 +#endif
 +
    // Ordered by the Z order, and then by the time of addition.
@@ -4030,7 +4033,7 @@ index 306118e..65b07b5 100644
    // From most likely the latest to most likely the earliest to be signaled, so
    // just one sleep will likely be needed.
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..6c8cbd3 100644
+index 7360ed9..d7cffe3 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -12,6 +12,7 @@
@@ -4068,7 +4071,30 @@ index 7360ed9..6c8cbd3 100644
  #if REX_PLATFORM_WIN32
    if (dxgi_ui_tick_thread_.joinable()) {
      {
-@@ -613,6 +627,24 @@ bool Presenter::RefreshGuestOutput(
+@@ -449,6 +463,11 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+   if (ui_thread_paint_requested_.exchange(false, std::memory_order_relaxed)) {
+     do_paint = true;
+   }
++#if REX_PLATFORM_PS5
++  if (frame_pacing_thread_.joinable()) {
++    do_paint &= frame_pacing_consume_pending_.load(std::memory_order_acquire);
++  }
++#endif
+   PaintResult paint_result = PaintResult::kNotPresented;
+   bool request_repaint_at_tick = false;
+   bool request_repaint_immediately = false;
+@@ -582,6 +601,10 @@ bool Presenter::RefreshGuestOutput(
+   // after switching from UI thread painting to doing it in the guest output
+   // thread, will immediately recover to having the latest frame always sent to
+   // the host present call on the CPU and all frames reaching a present call).
++#if REX_PLATFORM_PS5
++  // Publish identity with the mailbox's release, before the consumer can acquire it.
++  frame_pacing_image_sequence_[guest_output_mailbox_writable_] = ++frame_pacing_next_image_;
++#endif
+   uint32_t last_acquired_and_ready =
+       guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
+   // Desired acquired = current acquired (changed only by the consumers).
+@@ -613,6 +636,24 @@ bool Presenter::RefreshGuestOutput(
      guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
    }
  
@@ -4093,7 +4119,7 @@ index 7360ed9..6c8cbd3 100644
    // Trigger the presentation on the host.
    PaintResult paint_result = PaintResult::kNotPresented;
    {
-@@ -796,9 +828,139 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
+@@ -796,9 +837,181 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
    dxgi_ui_tick_thread_ = std::thread(&Presenter::DXGIUITickThread, this);
  #endif  // XE_PLATFORM
  
@@ -4126,6 +4152,9 @@ index 7360ed9..6c8cbd3 100644
 +  // Whether frames are arriving; while idle, wait for the next one instead of
 +  // presenting the same image every refresh.
 +  bool streaming = false;
++#if REX_PLATFORM_PS5
++  auto next_request = std::chrono::steady_clock::now();
++#endif
 +  for (;;) {
 +    uint64_t published;
 +    double interval_ms;
@@ -4163,6 +4192,16 @@ index 7360ed9..6c8cbd3 100644
 +      }
 +      continue;
 +    }
++    {
++      std::unique_lock<std::mutex> lock(frame_pacing_mutex_);
++      frame_pacing_condition_.wait_until(lock, next_request,
++                                        [&] { return frame_pacing_shutdown_; });
++      if (frame_pacing_shutdown_) return;
++    }
++    // Schedule from request time, not completion time: scanout latency must
++    // not be added to the frame period. The PS5 output runs at 59.94 Hz.
++    next_request = std::chrono::steady_clock::now() +
++        std::chrono::nanoseconds(uint64_t(refreshes_per_frame) * 16683350);
 +    const uint64_t previous_flip = rex_ps5_display_flip_serial();
 +#endif
 +    PaintResult paint_result = PaintResult::kNotPresented;
@@ -4209,7 +4248,36 @@ index 7360ed9..6c8cbd3 100644
 +    }
 +    if (streaming) {
 +      consumed = published;
-+      shown_refreshes = 1;
++      shown_refreshes = refreshes_per_frame;
++      static uint64_t last_image = 0;
++      static uint64_t completed_images = 0;
++      static uint64_t repeated_images = 0;
++      static auto report_start = std::chrono::steady_clock::now();
++      static auto last_completion = report_start;
++      static double max_gap_ms = 0;
++      const auto now = std::chrono::steady_clock::now();
++      const uint64_t image = frame_pacing_acquired_image_.load(std::memory_order_acquire);
++      if (image != last_image) {
++        if (last_image) {
++          max_gap_ms = std::max(max_gap_ms,
++              std::chrono::duration<double, std::milli>(now - last_completion).count());
++        }
++        last_completion = now;
++        ++completed_images;
++      } else {
++        ++repeated_images;
++      }
++      last_image = image;
++      const double seconds = std::chrono::duration<double>(now - report_start).count();
++      if (seconds >= 5.0) {
++        REXLOG_INFO("PS5 display cadence: seconds={:.2f} distinct_images={} repeated_images={} "
++                    "max_gap_ms={:.1f} guest_image={} submitted_flip={}",
++                    seconds, completed_images, repeated_images, max_gap_ms, image,
++                    rex_ps5_display_flip_serial());
++        report_start = now;
++        completed_images = repeated_images = 0;
++        max_gap_ms = 0;
++      }
 +    } else {
 +      // A failed paint/flip has not consumed a displayed frame. Avoid spinning
 +      // on an unavailable surface, and recheck shutdown on the next iteration.
@@ -4233,7 +4301,7 @@ index 7360ed9..6c8cbd3 100644
  std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
      uint32_t& mailbox_index_or_max_if_inactive_out, GuestOutputProperties* properties_out,
      GuestOutputPaintConfig* paint_config_out) {
-@@ -824,10 +986,18 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+@@ -824,10 +1037,18 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
    // consumer though, the consumer mutex performs memory access ordering).
    uint32_t old_acquired_and_ready =
        guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
@@ -4254,7 +4322,7 @@ index 7360ed9..6c8cbd3 100644
    // Either the same image as during the last consumption, or a new one, is
    // satisfying. However, if it's new, using memory_order_acq_rel to acquire the
    // new ready image (to make it acquired) and to release the old acquired image
-@@ -837,7 +1007,8 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+@@ -837,9 +1058,16 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
               old_acquired_and_ready, desired_acquired_and_ready, std::memory_order_acq_rel,
               std::memory_order_relaxed)) {
      desired_acquired_and_ready =
@@ -4263,7 +4331,27 @@ index 7360ed9..6c8cbd3 100644
 +                      : (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
    }
    uint32_t mailbox_index = desired_acquired_and_ready & 3;
++#if REX_PLATFORM_PS5
++  if (!hold) {
++    frame_pacing_acquired_image_.store(frame_pacing_image_sequence_[mailbox_index],
++                                       std::memory_order_release);
++  }
++#endif
    // Give the current acquired image to the caller, or UINT32_MAX if it's
+   // inactive.
+   const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
+@@ -1310,6 +1538,11 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
+     // lifecycle.
+     return PaintMode::kNone;
+   }
++#if REX_PLATFORM_PS5
++  if (frame_pacing_thread_.joinable()) {
++    return PaintMode::kUIThreadOnRequest;
++  }
++#endif
+   if (!REXCVAR_GET(host_present_from_non_ui_thread)) {
+     return PaintMode::kUIThreadOnRequest;
+   }
 diff --git a/src/ui/renderdoc_api.cpp b/src/ui/renderdoc_api.cpp
 index e1a5287..2a24b2b 100644
 --- a/src/ui/renderdoc_api.cpp

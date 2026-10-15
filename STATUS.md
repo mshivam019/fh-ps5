@@ -129,11 +129,33 @@ counterexample with the UI running before the pacer produces only 20, 15 or
 The console log has no per-image acquisition/scanout correlation, so the exact
 queue depth and displayed cadence during the reported lag remain unmeasured.
 
-Next correction must give one scheduler ownership of guest-frame presentation
-and avoid filling the FIFO with held-image redraws. It must correlate guest
-image IDs with presentation serials and completed scanout before claiming
-stable cadence. The earlier native bridge smoke only proved flip progress;
-it did not test the combined UI/pacer/FIFO system.
+The next candidate gives the UI thread sole ownership of paced PS5 painting.
+UI ticks without a pending paced request cannot paint or queue held-image
+copies. Request deadlines run from the preceding request, not its completion;
+there is no extra refresh wait after scanout. Guest-image sequence numbers
+travel through the mailbox and are reported after confirmed display progress.
+The five-second `PS5 display cadence` log reports distinct and repeated images,
+completion-observation gaps, the acquired guest sequence and submitted flip.
+These timestamps observe completion after a vblank wait, not hardware scanout
+timestamps.
+
+The request-clocked host model maintains one queued image and two-refresh
+image intervals with either one or eight UI redraw attempts per refresh.
+The display bridge sanitizer regression still passes delayed submission,
+scanout, stale frames, queued-ahead frames and API-error handling.
+The native executable builds and its five loadable segments match deployment.
+The previous executable is retained as
+`eboot.bin.before-single-owner-20261015-200258`.
+
+Console smoke `single-owner` (`forza_021.log`) launched and remained running
+through the 40-second capture. VideoOut confirmed flip 1; no display-wait timeout
+appears in the captured kernel log. The last three cadence windows report
+142/149/149 distinct images in 5.02 seconds each, with 0/0/1 repeated images.
+Their maximum completion-observation gaps are 83.4/50.1/50.1 ms. The last guest
+window reports 150 swap requests in 5.00 seconds, max gap 33.5 ms. Thus the
+candidate sustains near-30 Hz presentation rather than the queue-feedback
+model's 15–20 Hz, but remaining display gaps and user-driven race/free-roam
+acceptance are not resolved by this boot capture.
 
 The PS5 presenter now waits for VideoOut display progress rather than counting
 `vkQueuePresentKHR` returns as completed refreshes. This covers direct and

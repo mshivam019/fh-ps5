@@ -1,5 +1,5 @@
 // Host regression for the native display completion bridge. Build with:
-// clang++ -std=c++23 -O2 ps5/tests/display.cpp ps5/app/native/display.cpp -o /tmp/forza-display-test
+// clang++ -std=c++23 -O2 -I.deps/rexglue-sdk/include ps5/tests/display.cpp ps5/app/native/display.cpp -o /tmp/forza-display-test
 #include <cassert>
 #include <cstdint>
 #include <cstdio>

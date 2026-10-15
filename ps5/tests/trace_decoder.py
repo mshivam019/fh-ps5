@@ -52,6 +52,34 @@ class TraceDecoderTests(unittest.TestCase):
         self.assertFalse(report['long_command_frames'][0]['complete'])
         self.assertEqual(report['long_command_frames'][0]['total_ms'], 52)
 
+    def test_extended_categories_keep_cpu_time_outside_wall_budget(self):
+        data = b'FHTRACE1' + event(0, 18, 17, 1600000000)
+        data += event(1, 41, 1)
+        for category in range(17):
+            data += event(60, 20 + category, 42, duration_ms=3)
+        data += event(60, 40, 42, 1, duration_ms=23)
+        report = trace.analyze(data)
+        frame = report['long_command_frames'][0]
+        self.assertTrue(frame['complete'])
+        self.assertEqual(frame['total_ms'], 51)
+        self.assertEqual(frame['thread_cpu_ms'], 23)
+        self.assertEqual(frame['cpu_clock_method'], 1)
+        self.assertEqual(report['cycle_frequency_hz'], 1600000000)
+        self.assertEqual(report['frame_category_count'], 17)
+        self.assertEqual(report['slowest_spans'], [])
+
+    def test_unsupported_cpu_clock_remains_unknown_not_zero(self):
+        data = b'FHTRACE1' + event(0, 18, 17)
+        data += event(1, 41, 0, 22)
+        for category in range(17):
+            data += event(60, 20 + category, 42, duration_ms=3)
+        report = trace.analyze(data)
+        frame = report['long_command_frames'][0]
+        self.assertIsNone(frame['thread_cpu_ms'])
+        self.assertIsNone(frame['cpu_clock_method'])
+        self.assertEqual(report['cpu_clock_status'][0]['method'], 0)
+        self.assertEqual(report['cpu_clock_status'][0]['error'], 22)
+
 
 if __name__ == '__main__':
     unittest.main()

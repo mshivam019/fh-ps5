@@ -1,5 +1,9 @@
 // Bounded reusable capture. Producers never allocate, wait, or write files.
 #include "diagnostic_trace_queue.h"
+#include <rex/diagnostic_trace.h>
+#include <cerrno>
+#include <sys/resource.h>
+#include <time.h>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -12,12 +16,43 @@ namespace {
 using diagnostic_trace::Event;
 diagnostic_trace::Queue queue;
 std::atomic<bool> enabled{false};
+std::atomic<double> ns_per_tick{0};
 uint64_t now() {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 }
 extern "C" bool rex_ps5_trace_enabled() { return enabled.load(std::memory_order_relaxed); }
+extern "C" double rex_ps5_trace_ns_per_tick() {
+  return ns_per_tick.load(std::memory_order_relaxed);
+}
+extern "C" uint64_t rex_ps5_trace_thread_cpu_time(uint32_t* method) {
+  static thread_local int selected = -1;
+  auto select = [&](int value, int error) {
+    if (selected != value) {
+      selected = value;
+      rex_ps5_trace(41, uint64_t(value), uint64_t(error), 0, nullptr);
+      fprintf(stderr, "[frame trace] thread CPU clock method=%d error=%d (1=clock,2=rusage,0=unavailable)\n", value, error);
+    }
+    *method = uint32_t(value);
+  };
+  if (selected == 0) { *method = 0; return 0; }
+  if (selected != 2) {
+    timespec time{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) == 0) {
+      select(1, 0);
+      return uint64_t(time.tv_sec) * 1000000000 + uint64_t(time.tv_nsec);
+    }
+  }
+  rusage usage{};
+  if (getrusage(RUSAGE_THREAD, &usage) == 0) {
+    select(2, 0);
+    return (uint64_t(usage.ru_utime.tv_sec) + uint64_t(usage.ru_stime.tv_sec)) * 1000000000 +
+           (uint64_t(usage.ru_utime.tv_usec) + uint64_t(usage.ru_stime.tv_usec)) * 1000;
+  }
+  select(0, errno);
+  return 0;
+}
 extern "C" void rex_ps5_trace(uint32_t stage, uint64_t id, uint64_t argument,
                                uint64_t duration_ns, const char* path) {
   if (!rex_ps5_trace_enabled()) return;
@@ -40,6 +75,21 @@ void StartDiagnosticTrace(const char* marker_path, const char* output_path) {
   const char magic[8] = {'F','H','T','R','A','C','E','1'};
   if (fwrite(magic, 1, sizeof(magic), output) != sizeof(magic)) { fclose(output); return; }
   fflush(output);
+  const uint64_t start_ticks = rex::diagnostic::ActivityTicks();
+  const uint64_t start_ns = now();
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  const uint64_t elapsed_ns = now() - start_ns;
+  const uint64_t elapsed_ticks = rex::diagnostic::ActivityTicks() - start_ticks;
+  if (!elapsed_ticks || !elapsed_ns) { fclose(output); return; }
+  const double scale = double(elapsed_ns) / double(elapsed_ticks);
+  ns_per_tick.store(scale, std::memory_order_relaxed);
+  Event config{};
+  config.timestamp = now(); config.stage = 18;
+  config.id = rex::diagnostic::kFrameCategories;
+  config.argument = uint64_t(1000000000.0 / scale);
+  queue.Push(config);
+  fprintf(stderr, "[frame trace] calibrated ticks_hz=%llu categories=%u\n",
+          (unsigned long long)config.argument, rex::diagnostic::kFrameCategories);
   enabled.store(true, std::memory_order_release);
   std::thread([output] {
     constexpr uint64_t kMaxEvents = (64 * 1024 * 1024 - 8) / sizeof(Event);

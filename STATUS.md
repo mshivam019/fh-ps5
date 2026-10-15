@@ -270,12 +270,20 @@ Events cover GPU swap arrival, mailbox publication and acquisition, paced UI
 requests, UI paint boundaries, native flip submission and observed completion.
 Spans over two milliseconds cover command starvation, blocking submission-fence
 checks, swap submission, swap processing and host-file reads with paths and
-requested byte counts. Exclusive per-frame wall-time categories cover command
-dispatch, empty-command-ring waits, register waits, blocking fence checks,
-swap work, swap submission and remaining worker time. Nested waits are
-subtracted from their parent category; all waits count, even under two
-milliseconds. Wall time includes OS descheduling. These categories do not
-directly measure CPU utilization, decompression, every guest wait or GPU execution.
+requested byte counts. Seventeen exclusive per-frame wall-time categories cover
+remaining worker time, residual command dispatch, empty-ring/register/fence
+waits, swap work, submission, primitives, textures, render targets, pipelines,
+bindings, vertex buffers, constants, resolves/readbacks, shader translation and
+samplers. Nested categories are subtracted from their parent. Ordered cycle
+reads, calibrated against the steady clock at startup, avoid a system-clock call
+at every draw-stage boundary. Wall time still includes OS descheduling.
+
+Thread CPU time is sampled once per command frame. The console probe selected
+`CLOCK_THREAD_CPUTIME_ID`; `getrusage(RUSAGE_THREAD)` is a fallback. An unsupported
+clock is reported as unavailable, never as zero CPU usage. This CPU total covers
+the whole frame interval, not CPU time for each individual stage. Residual
+dispatch includes command decoding and uninstrumented work; neither it nor
+whole-frame wall time alone proves CPU saturation.
 
 Download the binary over FTP and decode locally:
 
@@ -293,13 +301,17 @@ Local verification: `ps5/tests/trace_queue.cpp` covers empty/saturated queues,
 FIFO wraparound beyond 65,536 records, concurrent integrity and exact drop
 accounting under AddressSanitizer and UndefinedBehaviorSanitizer.
 `ps5/tests/trace_decoder.py` checks exclusive totals versus contiguous spans,
-race cutoffs, incomplete frame categories, health counters and partial records.
-An actual writer smoke preserved 160,000 unique events with zero drops across
-buffer reuse and 80 complete nested wall-time snapshots.
+race cutoffs, incomplete frame categories, health counters, partial records,
+17-category metadata, CPU totals outside the wall budget and unsupported CPU
+clocks. An actual writer smoke preserved 160,000 unique events with zero drops.
+A later calibrated-clock smoke separated 3 ms dispatch, 5 ms textures, 10 ms
+fence sleep and 2 ms constants into exclusive categories: wall totals were
+20.10–20.23 ms and thread CPU totals 9.97–9.99 ms on the host. These are helper
+smoke measurements, not console gameplay measurements.
 
-The sustained diagnostic executable preserves the previous executable as
-`eboot.bin.before-sustained-race-diagnostics-20261015-203944`. Its matching local
-symbols are `build/console/sustained-race-symbols.elf`. Saves, graphics settings,
+The dispatch-stage executable preserves the previous executable as
+`eboot.bin.before-dispatch-stage-diagnostics-20261015-205323`. Matching local
+symbols are `build/console/dispatch-stage-symbols.elf`. Saves, graphics settings,
 thumbnail readbacks and shader caches are unchanged.
 
 ### First diagnostic findings
@@ -446,3 +458,22 @@ the next diagnostic slice to operations inside dispatch versus OS descheduling.
 It does not yet identify a particular texture, draw or resource operation,
 and does not establish CPU saturation. Keep the current race build unchanged
 until the user completes the comparison run.
+
+### Dispatch-stage capture verification
+
+The previous completed race is preserved in
+`build/console/sustained-race-finished-trace.bin` and its decoded report.
+It spans 300.919 seconds with 158,912 events, six dropped events and zero
+repeated-image completions in the race-only section.
+
+The dispatch-stage console smoke remained running through its 45-second
+capture. The subsequent snapshot spans 57.035 seconds, has 49,926 events with
+zero drops/repeated completions, and contains 1,760 complete 17-category
+snapshots. The kernel CPU-clock probe succeeds with method 1 (thread CPU clock).
+This confirms the instrumentation works; startup timing is not gameplay evidence.
+
+The user started the next same-race comparison at an observed elapsed
+113.893 seconds. `build/console/dispatch-race-start-marker.json` records the
+cutoff. At this observation, the latest health record reports one dropped
+startup event. Exclude earlier boot/title samples and do not replace or
+restart this build during the race.

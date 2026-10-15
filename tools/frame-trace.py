@@ -11,10 +11,14 @@ STAGES = {1: 'gpu_swap', 2: 'slow_swap', 3: 'publish', 4: 'request',
           5: 'acquire', 6: 'display_complete', 7: 'command_starvation',
           8: 'fence_wait', 9: 'swap_submission', 10: 'file_read',
           11: 'ui_begin', 12: 'ui_end', 14: 'flip_submit', 15: 'flip_observed',
-          16: 'gpu_register_wait', 17: 'capture_health',
+          16: 'gpu_register_wait', 17: 'capture_health', 18: 'capture_config',
           20: 'frame_unclassified', 21: 'frame_dispatch', 22: 'frame_empty_ring',
           23: 'frame_register_wait', 24: 'frame_fence_wait',
-          25: 'frame_swap', 26: 'frame_submission'}
+          25: 'frame_swap', 26: 'frame_submission', 27: 'frame_primitives',
+          28: 'frame_textures', 29: 'frame_targets', 30: 'frame_pipelines',
+          31: 'frame_bindings', 32: 'frame_vertex_buffers', 33: 'frame_constants',
+          34: 'frame_resolve_readback', 35: 'frame_shader_translation',
+          36: 'frame_samplers', 40: 'thread_cpu_time', 41: 'cpu_clock_status'}
 
 
 def analyze(data, after_seconds=0):
@@ -33,6 +37,9 @@ def analyze(data, after_seconds=0):
     origin = events[0]['ns']
     capture_seconds = (events[-1]['ns'] - origin) / 1e9
     health = [event for event in events if event['stage'] == 'capture_health']
+    configs = [event for event in events if event['stage'] == 'capture_config']
+    category_count = configs[-1]['id'] if configs else 7
+    cpu_status = [event for event in events if event['stage'] == 'cpu_clock_status']
     events = [event for event in events if (event['ns'] - origin) / 1e9 >= after_seconds]
     publications = {}; acquisitions = {}; flips = {}; last_request = None
     last_display = None; last_image = None; gaps = []; repeated = 0
@@ -40,14 +47,21 @@ def analyze(data, after_seconds=0):
             event['stage'] in ('slow_swap', 'command_starvation', 'fence_wait',
                                'swap_submission', 'file_read', 'gpu_register_wait')]
     frames = {}
+    cpu_samples = {}
     for event in events:
         if event['stage'].startswith('frame_'):
             frame = frames.setdefault(event['id'], {})
             frame[event['stage']] = round(event['duration_ns'] / 1e6, 6)
+        elif event['stage'] == 'thread_cpu_time':
+            cpu_samples[event['id']] = event
     def breakdown(frame_id):
         parts = frames.get(frame_id, {})
-        return dict(command_frame=frame_id, complete=len(parts) == 7,
-                    total_ms=round(sum(parts.values()), 3), categories_ms=parts)
+        cpu = cpu_samples.get(frame_id)
+        total = round(sum(parts.values()), 3)
+        return dict(command_frame=frame_id, complete=len(parts) == category_count,
+                    total_ms=total, categories_ms=parts,
+                    thread_cpu_ms=round(cpu['duration_ns'] / 1e6, 3) if cpu else None,
+                    cpu_clock_method=cpu['argument'] if cpu else None)
     publication_frames = {}; current_command_frame = None
     for event in events:
         stage = event['stage']; image = event['id']
@@ -86,6 +100,10 @@ def analyze(data, after_seconds=0):
                 analysis_start_seconds=after_seconds,
                 dropped_events=health[-1]['id'] if health else None,
                 health_samples=len(health),
+                frame_category_count=category_count,
+                cycle_frequency_hz=configs[-1]['argument'] if configs else None,
+                cpu_clock_status=[dict(method=event['id'], error=event['argument'],
+                                       thread=event['thread']) for event in cpu_status],
                 long_command_frames=[breakdown(frame_id) for frame_id, parts in frames.items()
                                      if sum(parts.values()) > 45],
                 stages=dict(collections.Counter(event['stage'] for event in events)),
@@ -95,7 +113,7 @@ def analyze(data, after_seconds=0):
                                     id=e['id'], argument=e['argument'])
                                for e in sorted(slow, key=lambda e: e['duration_ns'], reverse=True)[:30]],
                 display_gaps=gaps,
-                caveat='Wall-time categories include descheduling, not CPU utilization. Frame categories are exclusive totals, not contiguous spans. Overlap is not causation. Completion timestamps are observations, not hardware scanout timestamps. Individual slow spans have a 2 ms threshold. Reusable capture stops after 10 minutes or 64 MiB; check dropped_events and kernel write-error status.')
+                caveat='Stage wall time uses startup-calibrated ordered cycle reads and includes descheduling. Thread CPU time is reported only if a supported clock succeeds; method 1=thread clock, 2=thread rusage. Frame categories are exclusive totals, not contiguous spans. Residual dispatch includes uninstrumented command work. Overlap is not causation. Completion timestamps are observations, not hardware scanout timestamps. Reusable capture stops after 10 minutes or 64 MiB; check dropped_events and kernel write-error status.')
 
 
 def main():

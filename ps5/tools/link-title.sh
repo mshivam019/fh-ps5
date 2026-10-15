@@ -69,6 +69,7 @@ if $platform_has_localeconv && [[ " ${radv_link_flags[*]} " != *" --defsym=local
     radv_link_flags+=(--defsym=localeconv=ps5_localeconv --version-script "$work/link/localeconv-local.map")
 fi
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --error-limit=0 --gc-sections --eh-frame-hdr --wrap=exit --wrap=_Exit --wrap=_exit --wrap=abort "${radv_link_flags[@]}" \
+    --wrap=sceVideoOutOpen --wrap=sceVideoOutClose --wrap=sceVideoOutSubmitFlip \
     --version-script "$native/app-symbols.map" --exclude-libs=ALL \
     -e _start -o "$work/link/llvm-pie.elf" \
     "$work/link/obj/app_crt.o" "${objects[@]}" \

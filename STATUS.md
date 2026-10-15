@@ -105,6 +105,55 @@ improving pacing. Unchanged shader-constant comparisons provided no throughput
 gain and were removed. Neither experiment is included in this candidate.
 
 
+### Display-completion pacing and scheduler corrections
+
+The PS5 presenter now waits for VideoOut display progress rather than counting
+`vkQueuePresentKHR` returns as completed refreshes. This covers direct and
+UI-thread presentation. A paced acquisition token prevents independent UI
+redraws from taking newer guest images before their scheduled refresh.
+
+The completion bridge accepts the first displayed serial newer than the
+captured submission. It does not chase the newest queued serial: that caused
+repeated 250 ms pacing-thread timeouts while the UI kept submitting frames.
+Those timeouts do not establish a 250 ms screen freeze.
+
+Guest vblank now sleeps toward its guest-clock deadline instead of polling every
+millisecond. Detailed per-draw timing is opt-in; the five-second frame-gap and
+pipeline-wait logs remain enabled. Graphics, thumbnail readbacks, saves and
+shader caches remain enabled and unchanged.
+
+Verification:
+
+- Native display regression passes with AddressSanitizer and UndefinedBehaviorSanitizer:
+  delayed submission, delayed scanout, stale frames, queued-ahead frames, API
+  errors and output close. The queued-ahead regression failed before its fix.
+- Linux scheduler smoke emitted 120 ticks in both modes. Deadline waiting used
+  121 wakeups versus 1,892; p95 lateness was 304 us versus 976 us. These are host
+  measurements, not console scheduler measurements.
+- PS5 runtime and executable build successfully. Deployment verifies all five
+  loadable ELF segments and retains the previous executable.
+- Earlier console build `pacing-ui` confirmed a completed VideoOut flip, but
+  still logged pacing timeouts. Its gameplay log includes a five-second window
+  with seven gaps over 50 ms, maximum 99.9 ms, and only 0.8 ms of pipeline waits.
+  Later windows delivered 150 swap requests in five seconds. These counters
+  measure guest swap requests, not displayed-frame cadence.
+- Corrected console smoke `pacing-complete` ran for 30 seconds, confirmed
+  VideoOut flip 29, and recorded no display-wait timeout in its kernel capture.
+  Guest swap gaps still reached 82–150 ms in the later five-second windows.
+  Successful display synchronization does not remove late guest frames.
+- The corrected build still requires a user-driven race/free-roam comparison.
+  No stutter-elimination or cold-area performance claim is established.
+
+References:
+
+- [Vulkan presentation contract](https://docs.vulkan.org/refpages/latest/refpages/source/vkQueuePresentKHR.html):
+  queueing presentation is not evidence that scanout completed.
+- [Android frame-pacing guidance](https://developer.android.com/games/sdk/frame-pacing):
+  synchronize presentation with display timing and avoid queue stuffing.
+- [Upstream Forza performance findings](https://github.com/Dyotson/RecompiledForzaHorizon/blob/main/docs/perf.md):
+  distinguish guest and presentation cadence; preserve texture invalidation,
+  sampler lifetimes and required readbacks when optimizing graphics work.
+
 ## Other open items
 
 - **Test PlayStation prompts on the console.** Built into the current `eboot.bin`

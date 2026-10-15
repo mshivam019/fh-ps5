@@ -49,6 +49,21 @@ index c9dfc17..4f35791 100644
  
  # Add tests subdirectory if tests are enabled
  if(REXGLUE_BUILD_TESTS)
+diff --git a/cmake/rexglue_export_targets.cmake b/cmake/rexglue_export_targets.cmake
+index 2d40e1f..237cc8b 100644
+--- a/cmake/rexglue_export_targets.cmake
++++ b/cmake/rexglue_export_targets.cmake
+@@ -4,7 +4,9 @@ set_target_properties(rexui PROPERTIES EXPORT_NAME ui)
+ set_target_properties(rexinput PROPERTIES EXPORT_NAME input)
+ set_target_properties(rexaudio PROPERTIES EXPORT_NAME audio)
+ set_target_properties(rexruntime PROPERTIES EXPORT_NAME runtime)
+-set_target_properties(rexcodegen PROPERTIES EXPORT_NAME codegen)
++if(TARGET rexcodegen)  # absent when tools are not built (PS5)
++    set_target_properties(rexcodegen PROPERTIES EXPORT_NAME codegen)
++endif()
+ 
+ set(REXGLUE_INSTALL_TARGETS
+     rexruntime
 diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
 index d876846..0dee191 100644
 --- a/include/rex/chrono/chrono.h

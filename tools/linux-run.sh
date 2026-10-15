@@ -5,7 +5,7 @@
 # Usage: tools/linux-run.sh TAG SECONDS [extra runtime args]
 # Env: FORZA_AUTOPRESS (default: boot videos, title, main menu, Single Player,
 #      skip the festival video, then hold the throttle), SHOT_EVERY (15),
-#      BUILD (build/linux), SDK (.deps/rexglue-sdk).
+#      BUILD (build/linux), SDK (.deps/rexglue-sdk), PRELOAD (library for the game only).
 set -u
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 tag=$1; seconds=$2; shift 2
@@ -18,6 +18,7 @@ inner="$out/inner.sh"
   echo '#!/usr/bin/env bash'
   echo "cd '$build'"
   echo "export LD_LIBRARY_PATH='$build:$sdk/out/linux-amd64' SDL_VIDEODRIVER=wayland"
+  [[ -n ${PRELOAD:-} ]] && echo "export LD_PRELOAD='$PRELOAD'"
   echo "export RECOMP_PERF=1 RECOMP_PERF_SCENE=boot FORZA_FRAMEDUMP_DIR='$out' FORZA_SCREENSHOT_TRIGGER='$out/shot.trigger'"
   printf 'exec ./forza --game_data_root=%q --user_data_root=%q --log_file=%q --audio_mute=true' \
     "$root/private/game" "$root/build/run-user" "$out/forza.log"

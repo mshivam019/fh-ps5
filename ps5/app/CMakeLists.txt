@@ -23,7 +23,7 @@ execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/../to
     --output "${FORZA_MODULE_GENERATED}"
     COMMAND_ERROR_IS_FATAL ANY)
 
-add_library(forza_app STATIC main.cpp builtin-module.cpp input.cpp
+add_library(forza_app STATIC main.cpp builtin-module.cpp input.cpp button_prompts.cpp
     native/platform.c
     "${FORZA_MODULE_DIR}/loader.cpp" "${FORZA_MODULE_DIR}/game_module.cpp"
     "${FORZA_MODULE_GENERATED}/module_exports.cpp"

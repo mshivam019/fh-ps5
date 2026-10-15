@@ -107,6 +107,34 @@ gain and were removed. Neither experiment is included in this candidate.
 
 ### Display-completion pacing and scheduler corrections
 
+**Rejected console candidate:** the user reported lag with the completed pacing
+build. The pre-experiment executable was restored byte-for-byte from
+`eboot.bin.before-display-pacing-20261015-193641`. The attempted rollback launch
+returned `launch_sony_error_0x80020008`; the subsequent process query found no
+running Forza process. Do not treat this source revision as a proven improvement.
+
+The full lagging runtime log is `build/console/pacing-lag-full-runtime.log`
+(console `forza_020.log`). Excluding the first two startup windows, 20 windows
+average 29.46 guest swap requests per second, with 57 gaps over 50 ms and a
+150 ms maximum. This does not measure distinct displayed images.
+
+The pacing change introduces a feedback bottleneck: UI redraws can continue
+queueing copies of the held guest image, but only the pacing thread grants a new
+image acquisition. It waits for a serial newer than the last submitted serial,
+then waits another vblank before granting the next acquisition. Queue delay
+therefore becomes part of the acquisition interval. A 60 Hz discrete-event
+counterexample with the UI running before the pacer produces only 20, 15 or
+12 distinct images per second with one, two or three queued images, despite
+30 Hz guest production. These are model results, not measured console FPS.
+The console log has no per-image acquisition/scanout correlation, so the exact
+queue depth and displayed cadence during the reported lag remain unmeasured.
+
+Next correction must give one scheduler ownership of guest-frame presentation
+and avoid filling the FIFO with held-image redraws. It must correlate guest
+image IDs with presentation serials and completed scanout before claiming
+stable cadence. The earlier native bridge smoke only proved flip progress;
+it did not test the combined UI/pacer/FIFO system.
+
 The PS5 presenter now waits for VideoOut display progress rather than counting
 `vkQueuePresentKHR` returns as completed refreshes. This covers direct and
 UI-thread presentation. A paced acquisition token prevents independent UI

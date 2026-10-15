@@ -1613,7 +1613,7 @@ index b4b885a..84d4b01 100644
  #include <sys/ioctl.h>
  #include <unistd.h>
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 0e66b35..e2915a6 100644
+index 0e66b35..a3c1d0b 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -1,3 +1,4 @@
@@ -1653,7 +1653,62 @@ index 0e66b35..e2915a6 100644
    return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
  #else
    return static_cast<uint32_t>(syscall(SYS_gettid));
-@@ -744,7 +752,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -689,23 +697,49 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     pthread_attr_t attr;
+     if (pthread_attr_init(&attr) != 0)
+       return false;
+-    if (pthread_attr_setstacksize(&attr, params.stack_size) != 0) {
++    if (int error = pthread_attr_setstacksize(&attr, params.stack_size); error != 0) {
++#if REX_PLATFORM_PS5
++      fprintf(stderr, "[thread] stack size %zu rejected: %d\n", size_t(params.stack_size), error);
++#endif
+       pthread_attr_destroy(&attr);
+       return false;
+     }
+     if (params.initial_priority != 0) {
+       sched_param sched{};
+       sched.sched_priority = params.initial_priority + 1;
+-      if (pthread_attr_setschedpolicy(&attr, SCHED_FIFO) != 0) {
++      int policy_error = pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
++      int param_error = policy_error ? 0 : pthread_attr_setschedparam(&attr, &sched);
++      if (policy_error || param_error) {
++#if REX_PLATFORM_PS5
++        // Keep the creator's scheduling (see the retry below).
++        fprintf(stderr, "[thread] priority %d refused: policy %d param %d\n",
++                params.initial_priority, policy_error, param_error);
++        pthread_attr_destroy(&attr);
++        pthread_attr_init(&attr);
++        pthread_attr_setstacksize(&attr, params.stack_size);
++        params.initial_priority = 0;
++#else
+         pthread_attr_destroy(&attr);
+         return false;
++#endif
+       }
+-      if (pthread_attr_setschedparam(&attr, &sched) != 0) {
++    }
++    int error = pthread_create(&thread_, &attr, ThreadStartRoutine, start_data);
++#if REX_PLATFORM_PS5
++    if (error != 0) {
++      fprintf(stderr, "[thread] pthread_create failed: %d (stack %zu, priority %d)\n", error,
++              size_t(params.stack_size), params.initial_priority);
++      if (params.initial_priority != 0) {
++        // Retry with the creator's scheduling when the guest priority is refused.
+         pthread_attr_destroy(&attr);
+-        return false;
++        pthread_attr_init(&attr);
++        pthread_attr_setstacksize(&attr, params.stack_size);
++        error = pthread_create(&thread_, &attr, ThreadStartRoutine, start_data);
++        fprintf(stderr, "[thread] retry without priority: %d\n", error);
+       }
+     }
+-    if (pthread_create(&thread_, &attr, ThreadStartRoutine, start_data) != 0) {
++#endif
++    if (error != 0) {
+       pthread_attr_destroy(&attr);
+       return false;
+     }
+@@ -744,7 +778,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
      auto result = std::array<char, 17>{'\0'};
      std::unique_lock<std::mutex> lock(state_mutex_);
      if (state_ != State::kUninitialized && state_ != State::kFinished) {
@@ -1664,7 +1719,7 @@ index 0e66b35..e2915a6 100644
        // pthread_getname_np was added in API 26 - below that, store the name in
        // this object, which may be only modified through Xenia threading, but
        // should be enough in most cases.
-@@ -769,7 +779,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -769,7 +805,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
      WaitStarted();
      std::unique_lock<std::mutex> lock(state_mutex_);
      if (state_ != State::kUninitialized && state_ != State::kFinished) {
@@ -1675,7 +1730,7 @@ index 0e66b35..e2915a6 100644
        // macOS pthread_setname_np() only names the calling thread.
        if (pthread_equal(thread_, pthread_self())) {
          pthread_setname_np(std::string(name).c_str());
-@@ -794,7 +806,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -794,7 +832,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
    }
  #endif
  
@@ -1688,7 +1743,7 @@ index 0e66b35..e2915a6 100644
    uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
  #else
    uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
-@@ -802,7 +818,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -802,7 +844,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    uint64_t affinity_mask() {
      WaitStarted();
@@ -1703,7 +1758,7 @@ index 0e66b35..e2915a6 100644
      // macOS doesn't expose Linux-style pthread affinity masks; report every
      // logical processor as available.
      auto cpu_count = std::min<uint32_t>(logical_processor_count(), 64);
-@@ -833,7 +855,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -833,7 +881,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    void set_affinity_mask(uint64_t mask) {
      WaitStarted();
@@ -1716,7 +1771,7 @@ index 0e66b35..e2915a6 100644
      // macOS doesn't expose Linux-style pthread affinity masks; keep this a
      // no-op so higher layers can build and run.
      (void)mask;
-@@ -906,7 +932,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -906,7 +958,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        return;
      }
  
@@ -1725,7 +1780,7 @@ index 0e66b35..e2915a6 100644
      // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
      // without the sigval payload.
      int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
-@@ -959,6 +985,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -959,6 +1011,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
      if (out_previous_suspend_count) {
        *out_previous_suspend_count = suspend_count_;
      }
@@ -1735,7 +1790,7 @@ index 0e66b35..e2915a6 100644
      --suspend_count_;
      if (suspend_count_ == 0 && state_ == State::kSuspended) {
        state_ = State::kRunning;
-@@ -1081,6 +1110,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1081,6 +1136,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
    mutable std::condition_variable state_signal_;
    std::deque<std::function<void()>> user_callbacks_;
    std::atomic<bool> has_pending_user_callbacks_{false};
@@ -1745,7 +1800,7 @@ index 0e66b35..e2915a6 100644
  #if REX_PLATFORM_ANDROID
    // Name accessible via name() on Android before API 26 which added
    // pthread_getname_np.
-@@ -1475,6 +1507,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1475,6 +1533,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
                                         [thread] { return thread->handle_.suspend_count_ == 0; });
    }
  
@@ -1755,7 +1810,7 @@ index 0e66b35..e2915a6 100644
    start_routine();
  
    {
-@@ -1547,7 +1582,11 @@ void Thread::Exit(int exit_code) {
+@@ -1547,7 +1608,11 @@ void Thread::Exit(int exit_code) {
  }
  
  void set_current_thread_name(const std::string_view name) {
@@ -3788,7 +3843,7 @@ index 76cc877..6c39358 100644
        if (unprotect_page) {
          if (unprotect_system_page_first == UINT32_MAX) {
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
-index 77bce25..b4c4de0 100644
+index 77bce25..ff2dcc3 100644
 --- a/src/system/xthread.cpp
 +++ b/src/system/xthread.cpp
 @@ -1,3 +1,4 @@
@@ -3796,8 +3851,14 @@ index 77bce25..b4c4de0 100644
  /**
   ******************************************************************************
   * Xenia : Xbox 360 Emulator Research Project                                 *
-@@ -433,6 +434,9 @@ X_STATUS XThread::Create() {
-   params.stack_size = 16_MiB;  // Allocate a big host stack.
+@@ -430,9 +431,14 @@ X_STATUS XThread::Create() {
+   RetainHandle();
+ 
+   rex::thread::Thread::CreationParameters params;
+-  params.stack_size = 16_MiB;  // Allocate a big host stack.
++  // Allocate a big host stack. On the PS5, 16 MiB stacks failed with EAGAIN
++  // at the 65th thread (Forza Horizon creates more).
++  params.stack_size = REX_PLATFORM_PS5 ? 4_MiB : 16_MiB;
    params.create_suspended = true;
    thread_ = rex::thread::Thread::Create(params, [this]() {
 +#if REX_PLATFORM_PS5
@@ -3806,7 +3867,7 @@ index 77bce25..b4c4de0 100644
      rex::initialize_seh_thread();
      runtime::ThreadState::Bind(thread_state_.get());
  
-@@ -445,6 +449,9 @@ X_STATUS XThread::Create() {
+@@ -445,6 +451,9 @@ X_STATUS XThread::Create() {
      PROFILE_THREAD_ENTER(thread_name_.c_str());
      PROFILE_THREAD_CREATED();
  
@@ -3816,7 +3877,7 @@ index 77bce25..b4c4de0 100644
      // Execute user code.
      current_xthread_tls_ = this;
      running_ = true;
-@@ -938,7 +945,7 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
+@@ -938,7 +947,7 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
      *out_suspend_count = previous_suspend_count;
    }
    return thread_->Resume(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
@@ -3825,7 +3886,7 @@ index 77bce25..b4c4de0 100644
    bool should_resume_host = false;
    {
      std::lock_guard<std::mutex> lock(suspend_mutex_);
-@@ -986,7 +993,7 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
+@@ -986,7 +995,7 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
    return thread_->Suspend(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
  }
  
@@ -3834,6 +3895,15 @@ index 77bce25..b4c4de0 100644
  uint32_t XThread::SelfSuspend() {
    auto guest_thread = guest_object<X_KTHREAD>();
    std::unique_lock<std::mutex> lock(suspend_mutex_);
+@@ -1391,7 +1400,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
+ 
+     rex::thread::Thread::CreationParameters params;
+     params.create_suspended = true;  // Not done restoring yet.
+-    params.stack_size = 16_MiB;
++    params.stack_size = REX_PLATFORM_PS5 ? 4_MiB : 16_MiB;
+     thread->thread_ = rex::thread::Thread::Create(params, [thread, state]() {
+       // Set thread ID override. This is used by logging.
+       rex::thread::set_current_thread_id(thread->handle());
 diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
 index 5bd3dc5..539764d 100644
 --- a/src/ui/CMakeLists.txt

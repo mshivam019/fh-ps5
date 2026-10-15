@@ -34,11 +34,19 @@ def remote_sha256(path):
         offset += len(chunk)
 
 
-def remote_entries(path):
+def remote_sizes(ftp, path):
+    """File sizes in a remote directory (FTP LIST; the control API caps listings at 256)."""
+    lines = []
     try:
-        return {e['name']: e for e in json.loads(call(36, {'path': path}))['entries']}
-    except RuntimeError:
-        return None
+        ftp.retrlines(f'LIST {path}', lines.append)
+    except ftplib.error_perm:
+        return {}
+    sizes = {}
+    for line in lines:
+        fields = line.split(None, 8)
+        if len(fields) == 9 and line.startswith('-'):
+            sizes[fields[8]] = int(fields[4])
+    return sizes
 
 
 def ensure_dir(ftp, path, known):
@@ -80,30 +88,49 @@ def main():
     if running:
         raise SystemExit(f'{TITLE} is running; close it first')
 
+    def connect():
+        ftp = ftplib.FTP()
+        ftp.connect(HOST, 2121, 300)
+        ftp.login()
+        ftp.voidcmd('TYPE I')
+        return ftp
+
+    ftp = connect()
     listings = {}
 
     def remote_size(name):
         directory, _, base = (REMOTE + '/' + name).rpartition('/')
         if directory not in listings:
-            listings[directory] = remote_entries(directory) or {}
-        entry = listings[directory].get(base)
-        return entry['size'] if entry else None
+            listings[directory] = remote_sizes(ftp, directory)
+        return listings[directory].get(base)
 
     pending = [(name, path) for name, path in files.items()
                if remote_size(name) != path.stat().st_size or name in ('eboot.bin', 'game/forza.module')]
     total = sum(path.stat().st_size for _, path in pending)
     print(f'{len(pending)} of {len(files)} files to upload ({total / 1e9:.2f} GB)', flush=True)
-    ftp = ftplib.FTP()
-    ftp.connect(HOST, 2121, 60)
-    ftp.login()
-    ftp.voidcmd('TYPE I')
     known = set()
     sent = 0
     for index, (name, path) in enumerate(pending, 1):
         target = f'{REMOTE}/{name}'
-        ensure_dir(ftp, target.rsplit('/', 1)[0], known)
-        with path.open('rb') as stream:
-            ftp.storbinary(f'STOR {target}', stream, 1 << 20)
+        for attempt in range(3):
+            try:
+                ensure_dir(ftp, target.rsplit('/', 1)[0], known)
+                with path.open('rb') as stream:
+                    ftp.storbinary(f'STOR {target}', stream, 1 << 20)
+                break
+            except (OSError, EOFError, ftplib.Error) as error:
+                # The console can be slow to confirm large files; check what arrived.
+                print(f'  retry {name}: {error}', flush=True)
+                try:
+                    ftp.close()
+                except OSError:
+                    pass
+                ftp = connect()
+                listings.pop(target.rsplit('/', 1)[0], None)
+                if remote_size(name) == path.stat().st_size:
+                    break
+        else:
+            raise SystemExit(f'Upload failed: {name}')
         sent += path.stat().st_size
         if index % 50 == 0 or path.stat().st_size > 50_000_000:
             print(f'  {index}/{len(pending)} {sent / 1e9:.2f} GB {name}', flush=True)

@@ -23,7 +23,9 @@ namespace forza {
 // The runtime's own `__imp__Name`: the module defines its overrides itself, so the
 // generated code calls those, and the app hands out the runtime's by name.
 GuestFunc SdkImport(const char* name) {
-  return reinterpret_cast<GuestFunc>(forza_runtime_symbol(name));
+  auto* result = reinterpret_cast<GuestFunc>(forza_runtime_symbol(name));
+  if (!result) REXLOG_ERROR("Runtime import {} is not in ps5/module/runtime-lookups.txt", name);
+  return result;
 }
 
 // The head-to-head challenge text box is an ImGui overlay on the desktop; the PS5 app

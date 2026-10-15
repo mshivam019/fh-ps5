@@ -1,0 +1,14 @@
+{
+  "compiler": {
+    "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64.tar.xz",
+    "sha256": "bb7bb7654b33d5aa8712acb837c963b2e0c56352560c76105270a3268c665c21",
+    "directory": "llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64",
+    "license": "Apache-2.0 WITH LLVM-exception (LLVM); used on the desktop only"
+  },
+  "sysroot": {
+    "url": "https://github.com/ps5-payload-dev/sdk/releases/download/v0.42/ps5-payload-sdk.zip",
+    "sha256": "8cfbc7cd5811e719eb4f0c47eea668d3dc7b40bc8ab11c4a5031d40c23ec02da",
+    "directory": "ps5-payload-sdk",
+    "license": "GPL-3.0-or-later SDK; only its C/C++ headers are used, on the desktop"
+  }
+}

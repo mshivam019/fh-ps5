@@ -1,0 +1,15 @@
+# Runtime implementations the game module's kernel overrides call (forza::SdkImport).
+# Taken from the upstream sources' SdkImport("...") calls.
+__imp__ExCreateThread
+__imp__KeSetAffinityThread
+__imp__KeSetBasePriorityThread
+__imp__NtClose
+__imp__NtWriteFile
+__imp__VdSwap
+__imp__XAudioSubmitRenderDriverFrame
+__imp__XMsgSystemProcessCall
+__imp__XamCreateEnumeratorHandle
+__imp__XamEnumerate
+__imp__XamNuiGetDeviceStatus
+__imp__XexGetProcedureAddress
+__imp__XexUnloadImage

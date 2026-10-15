@@ -1,0 +1,22 @@
+# PS5 defaults. Keep compiled shader descriptions between sessions.
+store_shaders = true
+log_level = "info"
+log_noisy = false
+log_flush_interval = 1
+
+# The game reads back car thumbnails it renders for the garage and profile.
+# "some" copies a resolve back the first time it is seen, which is what the
+# thumbnails need, and costs nothing in a race (upstream default).
+readback_resolve = "some"
+
+# Keep adjacent guest command buffers in one submission until required synchronization.
+vulkan_submit_on_primary_buffer_end = false
+
+# Keep CPU-uploaded GPU pages valid across frames; guest writes invalidate them
+# through write watches (16 KB host pages are watched when any guest page in
+# them is writable). Set true to re-upload every frame if graphics go stale.
+clear_memory_page_state = false
+
+# Present each frame for whole display refreshes (two at 30 FPS) from a pacing
+# thread, instead of whenever the frame is ready: removes uneven frame times.
+present_frame_pacing = true

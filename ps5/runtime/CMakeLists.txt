@@ -33,7 +33,7 @@ target_include_directories(forza_ps5_runtime INTERFACE
     "${REXSDK_DIR}/include"
     "/home/skm/Downloads/ps5/PS5_Vulkan/.deps/native/radv-release/include")
 
-option(FORZA_BUILD_APP "Compile private generated Naruto and native PS5 app archives" OFF)
+option(FORZA_BUILD_APP "Compile the native PS5 app archive" OFF)
 if(FORZA_BUILD_APP)
     add_subdirectory("${FORZA_ROOT}/ps5/app" "${CMAKE_CURRENT_BINARY_DIR}/app")
 endif()

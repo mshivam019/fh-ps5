@@ -122,6 +122,22 @@ From the Naruto PS5 port (`../Naruto-Rise-PS5`), reusable:
 - **Legal.** As with Naruto: no game data, generated code or game-derived
   executables in the repository or releases.
 
+## Progress
+
+- **October 15, 2026: phase 2 started before the game files arrived.**
+  - `tools/prepare-sdk.sh` clones upstream at the pinned commit
+    (`sources.json`), checks out SDK `bd833a2` with upstream's 34 patches into
+    `.deps/rexglue-sdk`, and applies `ps5/patches/rexglue-ps5.patch`.
+  - The SDK drift is small: `bd833a2` is 24 commits after Naruto's `c94f5eb`.
+    The Naruto PS5 patch was carried over by cherry-picking it (as a commit on
+    top of `c94f5eb` plus Naruto's upstream patches) onto `bd833a2` plus the
+    Forza patches. Five files conflicted, all in the GPU command processor and
+    shared memory: upstream's threaded submission and fetch-constant handling
+    replace Naruto's asynchronous submission and fetch-register helper, which
+    were removed; Naruto's request cache and page verifier are kept.
+  - The merged SDK compiles for Linux (`rexruntime`, `rexgpu-xenos`). The PS5
+    build is not set up yet.
+
 ## Immediate next steps
 
 1. You: put the Forza Horizon base-game ISO (and TU4 if available) in `private/`.

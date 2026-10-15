@@ -1,0 +1,4505 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c9dfc17..4f35791 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -19,6 +19,7 @@ project(ReXGlue
+ # Build Options
+ #==========================================================
+ option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
++option(REXGLUE_BUILD_TOOLS       "Build the host rexglue code generation tool" ON)
+ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
+ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
+ option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
+@@ -60,7 +61,7 @@ include(GNUInstallDirs)
+ include(CMakePackageConfigHelpers)
+ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rexglue_helpers.cmake)
+ 
+-if(UNIX AND NOT APPLE)
++if(UNIX AND NOT APPLE AND NOT PS5)
+     # Keep installed binaries self-contained by resolving shared libs relative
+     # to the install prefix (for example, bin -> ../lib).
+     set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
+@@ -153,7 +154,15 @@ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+     list(GET CMAKE_OSX_ARCHITECTURES 0 REX_TARGET_PROCESSOR)
+ endif()
+ 
+-if(WIN32)
++if(PS5)
++    if(NOT REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
++        message(FATAL_ERROR "Unsupported PS5 architecture: ${REX_TARGET_PROCESSOR}")
++    endif()
++    set(REX_PLATFORM "ps5-amd64")
++    add_compile_definitions(REX_PLATFORM_PS5=1)
++    # libc++ 18 gates jthread/stop_token behind its experimental library switch.
++    add_compile_definitions(_LIBCPP_ENABLE_EXPERIMENTAL)
++elseif(WIN32)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "win-amd64")
+     elseif(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+@@ -264,8 +273,10 @@ add_subdirectory(src/audio)
+ add_subdirectory(src/graphics)
+ add_subdirectory(src/system)
+ add_subdirectory(src/kernel)
+-add_subdirectory(src/codegen)
+-add_subdirectory(src/rexglue)
++if(REXGLUE_BUILD_TOOLS)
++    add_subdirectory(src/codegen)
++    add_subdirectory(src/rexglue)
++endif()
+ 
+ # Add tests subdirectory if tests are enabled
+ if(REXGLUE_BUILD_TESTS)
+diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
+index d876846..0dee191 100644
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -116,7 +116,7 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
+ 
+ namespace std::chrono {
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) || REX_PLATFORM_PS5
+ // Apple libc++ does not expose clock_time_conversion or clock_cast.
+ template <class, class>
+ struct clock_time_conversion {};
+diff --git a/include/rex/filesystem/case_path.h b/include/rex/filesystem/case_path.h
+new file mode 100644
+index 0000000..1624b1b
+--- /dev/null
++++ b/include/rex/filesystem/case_path.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <filesystem>
++#include <string_view>
++#include <system_error>
++
++namespace rex::filesystem {
++// Content names use Xbox's ASCII case-insensitive lookup. Preserve the stored
++// spelling so opening, overwriting and deleting all address the same package.
++inline std::filesystem::path ResolveCaseInsensitiveLeaf(const std::filesystem::path& path) {
++  std::error_code ec;
++  if (std::filesystem::exists(path, ec)) return path;
++  const auto wanted = path.filename().string();
++  auto equal = [](std::string_view a, std::string_view b) {
++    if (a.size() != b.size()) return false;
++    auto lower = [](unsigned char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; };
++    for (size_t i = 0; i < a.size(); ++i)
++      if (lower(a[i]) != lower(b[i])) return false;
++    return true;
++  };
++  std::filesystem::directory_iterator it(path.parent_path(), ec), end;
++  while (!ec && it != end) {
++    if (equal(it->path().filename().string(), wanted)) return it->path();
++    it.increment(ec);
++  }
++  // Missing paths retain their requested spelling for creation/error reporting.
++  return path;
++}
++}  // namespace rex::filesystem
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 198de7a..9b004bd 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -131,6 +131,22 @@ class CommandProcessor {
+   bool Save(::rex::stream::ByteStream* stream);
+   bool Restore(::rex::stream::ByteStream* stream);
+ 
++  // A resolve (EDRAM to memory copy) that has just been written. With resolve
++  // readback disabled, a title filter may request a synchronous readback of
++  // individual resolves the CPU needs, such as a save-file picture.
++  struct ResolveReadbackRequest {
++    uint32_t address;
++    uint32_t length;
++    xenos::ColorFormat format;
++    uint32_t pitch;
++    uint32_t height;
++  };
++  using ResolveReadbackFilter = bool (*)(const ResolveReadbackRequest& request);
++  // Called on the GPU command thread; set before the GPU starts. Exported: the
++  // GPU library hides symbols when built as a shared library.
++  [[gnu::visibility("default")]] static void SetResolveReadbackFilter(
++      ResolveReadbackFilter filter);
++
+  protected:
+   struct IndexBufferInfo {
+     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
+@@ -229,6 +245,7 @@ class CommandProcessor {
+ 
+   // Shared readback resolve mode with backend legacy-flag alias support.
+   ReadbackResolveMode GetReadbackResolveMode(bool legacy_readback_resolve_enabled) const;
++  static ResolveReadbackFilter resolve_readback_filter();
+   // Shared memexport readback enable state with backend legacy-flag override support.
+   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
+ 
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 3bbd52e..e7bd6eb 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -684,6 +684,20 @@ class RenderTargetCache {
+   // render targets. They are reordered so for one source, all transfers are
+   // consecutive in the array.
+   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
++
++  // Incremented whenever ownership_ranges_ or render_targets_ may change. A
++  // repeated Update with the same render target keys and EDRAM lengths and an
++  // unchanged epoch needs no ownership transfers and binds the same targets.
++  uint64_t ownership_epoch_ = 0;
++  struct UpdateMemo {
++    uint32_t rt_bit_index;
++    RenderTargetKey key;
++    uint32_t length_tiles;
++    RenderTarget* render_target;
++  };
++  UpdateMemo update_memo_[1 + xenos::kMaxColorRenderTargets];
++  uint32_t update_memo_count_ = 0;
++  uint64_t update_memo_epoch_ = UINT64_MAX;
+ };
+ 
+ }  // namespace rex::graphics
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index 07e201c..a65bbef 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -91,6 +91,36 @@ class TextureCache {
+ 
+   static uint32_t GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle);
+ 
++  // A guest texture's base level about to be uploaded from guest memory. A
++  // title hook may inspect it or rewrite the guest data in place (same size and
++  // layout) to substitute the texture; it returns whether it wrote the data.
++  struct GuestTextureLoad {
++    uint32_t base_address;
++    xenos::TextureFormat format;
++    xenos::DataDimension dimension;
++    xenos::Endian endianness;
++    uint32_t width;
++    uint32_t height;
++    bool tiled;
++    // The base level is in the packed mip tail (small textures).
++    bool base_packed;
++    uint32_t row_pitch_bytes;
++    uint32_t base_size_bytes;
++    // Host pointer to the big-endian guest data of the base level.
++    uint8_t* guest_data;
++  };
++  using GuestTextureLoadHook = bool (*)(const GuestTextureLoad& load);
++  // Called on the GPU command thread; set before the GPU starts.
++  // Exported: the GPU library hides symbols when built as a shared library.
++  [[gnu::visibility("default")]] static void SetGuestTextureLoadHook(GuestTextureLoadHook hook);
++
++  // GPU-thread-only diagnostic counts: notifications, reset bindings, kept bindings.
++  std::array<uint64_t, 3> TakeBindingInvalidationStats() {
++    auto stats = binding_invalidation_stats_;
++    binding_invalidation_stats_.fill(0);
++    return stats;
++  }
++
+   void TextureFetchConstantWritten(uint32_t index) { TextureFetchConstantsWritten(index, index); }
+   void TextureFetchConstantsWritten(uint32_t first_index, uint32_t last_index) {
+     if (first_index > last_index) {
+@@ -602,6 +632,7 @@ class TextureCache {
+   // Global watch for scaled resolve data invalidation.
+   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
+ 
++  std::array<uint64_t, 3> binding_invalidation_stats_{};
+   uint64_t current_submission_index_ = 0;
+   uint64_t current_submission_time_ = 0;
+ 
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 1440ca0..f0d5ea3 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -10,8 +10,10 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <mutex>
++#include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+@@ -33,6 +35,12 @@ class SharedMemory {
+   virtual void ClearCache();
+   void SetSystemPageBlocksValidWithGpuDataWritten();
+   void InvalidateAllPages();
++  // Debug check (cvar shared_memory_verify_valid_pages): hashes CPU-uploaded
++  // pages when they become valid and reports valid pages whose guest contents
++  // changed without an invalidation (writes missed by the write watches).
++  void VerifyValidPages();
++
++  memory::Memory& memory() const { return memory_; }
+ 
+   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                       void* context, uint32_t address_first, uint32_t address_last,
+@@ -114,8 +122,6 @@ class SharedMemory {
+   static constexpr uint32_t kHostGpuMemoryOptimalSparseAllocationLog2 = 22;
+   static_assert(kHostGpuMemoryOptimalSparseAllocationLog2 <= kBufferSizeLog2);
+ 
+-  memory::Memory& memory() const { return memory_; }
+-
+   uint32_t page_size_log2() const { return page_size_log2_; }
+ 
+   uint32_t host_gpu_memory_sparse_granularity_log2() const {
+@@ -164,8 +170,25 @@ class SharedMemory {
+   // Ranges that need to be uploaded, generated by GetRangesToUpload (a
+   // persistently allocated vector).
+   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
+-  // RequestRanges' merged ranges, kept to reuse the allocation.
+-  std::vector<std::pair<uint32_t, uint32_t>> request_ranges_merged_;
++  // Sorted, merged request ranges for RequestRanges (persistently allocated:
++  // requests come from every draw on the command processor thread).
++  std::vector<std::pair<uint32_t, uint32_t>> merged_request_ranges_;
++
++  // Incremented, in the global critical region, whenever any page may lose
++  // its valid state. Single ranges successfully requested with no increment
++  // since are still valid, so repeated requests skip the page checks.
++  std::atomic<uint64_t> validity_epoch_{0};
++  struct RequestCacheEntry {
++    uint32_t start = 0;
++    uint32_t length = 0;
++    uint64_t epoch = UINT64_MAX;
++  };
++  static constexpr uint32_t kRequestCacheSize = 256;
++  RequestCacheEntry request_cache_[kRequestCacheSize];
++  // Page index -> hash of the guest data when the page last became valid from
++  // a CPU upload. Only maintained while page verification is enabled.
++  std::unordered_map<uint32_t, uint64_t> verified_page_hashes_;
++  uint64_t verify_mismatched_pages_total_ = 0;
+ 
+   // Mutex between the guest memory subsystem and the command processor, to be
+   // locked when checking or updating validity of pages/ranges and when firing
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index e54198f..93614d7 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -22,6 +22,7 @@
+ #include <string>
+ #include <string_view>
+ #include <unordered_map>
++#include <thread>
+ #include <utility>
+ #include <vector>
+ 
+@@ -46,6 +47,7 @@
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/provider.h>
+ #include <rex/ui/vulkan/upload_buffer_pool.h>
++#include <rex/graphics/vulkan/descriptor_snapshot.h>
+ 
+ namespace rex::graphics::vulkan {
+ 
+@@ -594,7 +596,6 @@ class VulkanCommandProcessor : public CommandProcessor {
+   std::vector<CommandBuffer> command_buffers_writable_;
+   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
+   DeferredCommandBuffer deferred_command_buffer_;
+-
+   // Threaded submission (SubmissionJob). A submission's fence may only be waited for once the
+   // thread has submitted it (submission_thread_submitted_).
+   std::unique_ptr<rex::thread::Thread> submission_thread_;
+@@ -622,6 +623,9 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // Temporary storage with reusable memory for writing image and sampler
+   // descriptors.
+   std::vector<VkDescriptorImageInfo> descriptor_write_image_info_;
++  TextureDescriptorSnapshot texture_descriptor_snapshots_[2];
++  const VulkanShader* descriptor_texture_shaders_[2]{};
++  uint64_t descriptor_texture_epochs_[2]{};
+ 
+   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
+ 
+@@ -644,9 +648,11 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // Direct3D 12 PIX warnings.
+   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
+   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
++  static const VkDescriptorPoolSize kDescriptorPoolSizeDynamicUniformBuffer;
+   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
+   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
+   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_uniform_buffer_;
++  ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_dynamic_uniform_buffer_;
+   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_buffer_;
+   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
+   std::array<std::vector<VkDescriptorSet>, size_t(SingleTransientDescriptorLayout::kCount)>
+@@ -874,6 +880,9 @@ class VulkanCommandProcessor : public CommandProcessor {
+   const PipelineLayout* current_guest_graphics_pipeline_layout_;
+   VkDescriptorBufferInfo
+       current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferCount];
++  DynamicUniformDescriptorSnapshot<SpirvShaderTranslator::kConstantBufferCount>
++      constant_descriptor_snapshot_;
++  std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount> constant_dynamic_offsets_{};
+   // Whether up-to-date data has been written to constant (uniform) buffers, and
+   // the buffer infos in current_constant_buffer_infos_ point to them.
+   uint32_t current_constant_buffers_up_to_date_;
+diff --git a/include/rex/graphics/vulkan/descriptor_snapshot.h b/include/rex/graphics/vulkan/descriptor_snapshot.h
+new file mode 100644
+index 0000000..9edbe3f
+--- /dev/null
++++ b/include/rex/graphics/vulkan/descriptor_snapshot.h
+@@ -0,0 +1,60 @@
++#pragma once
++#include <vulkan/vulkan.h>
++#include <span>
++#include <array>
++#include <vector>
++namespace rex::graphics::vulkan {
++// Only retains CPU descriptions; ownership stays with the descriptor allocator.
++class TextureDescriptorSnapshot {
++ public:
++  void Invalidate() { valid_ = false; }
++  bool MatchesShape(VkDescriptorSetLayout layout, size_t texture_count, size_t sampler_count) const {
++    return valid_ && layout_ == layout && texture_count_ == texture_count &&
++           images_.size() == texture_count + sampler_count;
++  }
++  bool MatchesSampler(size_t index, VkSampler sampler) const {
++    return valid_ && index < images_.size() - texture_count_ &&
++           images_[texture_count_ + index].sampler == sampler;
++  }
++  bool MatchAndRemember(VkDescriptorSetLayout layout, size_t texture_count,
++                        std::span<const VkDescriptorImageInfo> images) {
++    bool same = valid_ && layout_ == layout && texture_count_ == texture_count && images_.size() == images.size();
++    if (same) {
++      for (size_t i = 0; i < images.size(); ++i) {
++        if (images_[i].sampler != images[i].sampler || images_[i].imageView != images[i].imageView ||
++            images_[i].imageLayout != images[i].imageLayout) { same = false; break; }
++      }
++    }
++    if (!same) {
++      layout_ = layout; texture_count_ = texture_count;
++      images_.assign(images.begin(), images.end()); valid_ = true;
++    }
++    return same;
++  }
++ private:
++  bool valid_ = false;
++  VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;
++  size_t texture_count_ = 0;
++  std::vector<VkDescriptorImageInfo> images_;
++};
++// Dynamic offsets are supplied at bind time. Descriptor identity depends only
++// on the underlying buffers and ranges; the layout is fixed for guest constants.
++template <size_t Count>
++class DynamicUniformDescriptorSnapshot {
++ public:
++  void Invalidate() { valid_ = false; }
++  bool MatchAndRemember(std::span<const VkDescriptorBufferInfo, Count> buffers) {
++    bool same = valid_;
++    for (size_t i = 0; i < Count; ++i) {
++      same &= infos_[i].buffer == buffers[i].buffer && infos_[i].range == buffers[i].range;
++      infos_[i] = {buffers[i].buffer, 0, buffers[i].range};
++    }
++    valid_ = true;
++    return same;
++  }
++  const VkDescriptorBufferInfo* data() const { return infos_.data(); }
++ private:
++  bool valid_ = false;
++  std::array<VkDescriptorBufferInfo, Count> infos_{};
++};
++}  // namespace rex::graphics::vulkan
+diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
+index 04856ee..a87e8e5 100644
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -85,6 +85,7 @@ class VulkanTextureCache final : public TextureCache {
+   // also since it may insert deferred barriers, before flushing the barriers
+   // preceding host GPU work.
+   void RequestTextures(uint32_t used_texture_mask) override;
++  uint64_t binding_usage_epoch() const { return texture_usage_epoch_; }
+ 
+   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
+                                               xenos::FetchOpDimension dimension, bool is_signed);
+@@ -205,6 +206,9 @@ class VulkanTextureCache final : public TextureCache {
+     // Doesn't transition (the caller must insert the barrier).
+     Usage SetUsage(Usage new_usage) {
+       Usage old_usage = usage_;
++      if (old_usage != new_usage) {
++        ++static_cast<VulkanTextureCache&>(texture_cache()).texture_usage_epoch_;
++      }
+       usage_ = new_usage;
+       return old_usage;
+     }
+@@ -327,7 +331,32 @@ class VulkanTextureCache final : public TextureCache {
+ 
+   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
+ 
++  struct SamplerParameterMemo {
++    bool valid = false;
++    VulkanShader::SamplerBinding binding{};
++    xenos::xe_gpu_texture_fetch_t fetch{};
++    int32_t anisotropic_override = -1;
++    xenos::AnisoFilter max_anisotropy{};
++    bool allow_invalid_fetch = false;
++    SamplerParameters parameters{};
++  };
++  // One last parameter result per fetch slot; contains no Vulkan resources.
++  mutable std::array<SamplerParameterMemo, 32> sampler_parameter_memos_{};
++  struct SubmissionSampler {
++    uint64_t submission = 0;
++    uint32_t parameters = 0;
++    VkSampler sampler = VK_NULL_HANDLE;
++  };
++  std::array<SubmissionSampler, 64> submission_samplers_{};
++
+   VulkanCommandProcessor& command_processor_;
++
++  // GPU-thread-only: invalidate repeated requests on binding or layout changes.
++  uint64_t texture_usage_epoch_ = 1;
++  uint64_t requested_texture_epoch_ = 0;
++  uint64_t requested_texture_submission_ = 0;
++  uint32_t requested_texture_mask_ = 0;
++  bool requested_texture_3d_wrappers_ = false;
+   VkPipelineStageFlags guest_shader_pipeline_stages_;
+ 
+   // Using the Vulkan Memory Allocator because texture count in games is
+diff --git a/include/rex/platform.h b/include/rex/platform.h
+index e90418d..93f7756 100644
+--- a/include/rex/platform.h
++++ b/include/rex/platform.h
+@@ -28,7 +28,9 @@
+ #include <TargetConditionals.h>
+ #endif
+ 
+-#if defined(TARGET_OS_MAC) && TARGET_OS_MAC
++#if defined(__PROSPERO__) || defined(REX_PLATFORM_PS5)
++#define REX_PLATFORM_PS5 1
++#elif defined(TARGET_OS_MAC) && TARGET_OS_MAC
+ #define REX_PLATFORM_MAC 1
+ #elif defined(WIN32) || defined(_WIN32)
+ #define REX_PLATFORM_WIN32 1
+@@ -59,6 +61,9 @@
+ #ifndef REX_PLATFORM_LINUX
+ #define REX_PLATFORM_LINUX 0
+ #endif
++#ifndef REX_PLATFORM_PS5
++#define REX_PLATFORM_PS5 0
++#endif
+ 
+ #if defined(__clang__)
+ #define REX_COMPILER_CLANG 1
+diff --git a/include/rex/platform/dynlib.h b/include/rex/platform/dynlib.h
+index e3fc40d..eb2a52a 100644
+--- a/include/rex/platform/dynlib.h
++++ b/include/rex/platform/dynlib.h
+@@ -59,6 +59,14 @@ inline constexpr const char* kVulkanLoader = "libvulkan.so";
+ inline constexpr const char* kRenderDoc = "libVkLayer_GLES_RenderDoc.so";
+ inline constexpr const char* kSpirvToolsSdkPath = "bin/libSPIRV-Tools-shared.so";
+ 
++#elif REX_PLATFORM_PS5
++
++// Vulkan is linked statically into a native title. Dynamic-library names are
++// retained only so platform-neutral code can compile; PS5 paths bypass dlopen.
++inline constexpr const char* kVulkanLoader = "";
++inline constexpr const char* kRenderDoc = "";
++inline constexpr const char* kSpirvToolsSdkPath = "";
++
+ #elif REX_PLATFORM_LINUX
+ 
+ inline constexpr const char* kVulkanLoader = "libvulkan.so.1";
+diff --git a/include/rex/string/numeric.h b/include/rex/string/numeric.h
+index 85994c7..eec442c 100644
+--- a/include/rex/string/numeric.h
++++ b/include/rex/string/numeric.h
+@@ -26,7 +26,7 @@
+ #include <rex/string/utf8.h>
+ #include <rex/vec128.h>
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
+ #include <locale.h>
+ #endif
+ 
+@@ -114,7 +114,7 @@ inline T ifs(const std::string_view value, bool force_hex) {
+   return result;
+ }
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
+ template <typename T>
+ inline std::from_chars_result portable_float_from_chars(const char* first, const char* last,
+                                                         T& value) {
+@@ -189,7 +189,7 @@ inline T fpfs(const std::string_view value, bool force_hex) {
+     }
+     std::memcpy(&result, &pun, sizeof(PUN));
+   } else {
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
+     auto [p, error] = portable_float_from_chars(range.data(), range.data() + range.size(), result);
+ #else
+     auto [p, error] = std::from_chars(range.data(), range.data() + range.size(), result,
+@@ -316,7 +316,7 @@ inline vec128_t from_string<vec128_t>(const std::string_view value, bool force_h
+         assert_always();
+         return vec128_t();
+       }
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
+       auto result = detail::portable_float_from_chars(p, end, v.f32[i]);
+ #else
+       auto result = std::from_chars(p, end, v.f32[i], std::chars_format::general);
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 0c39a42..599ec66 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -39,7 +39,7 @@ namespace rex::memory::detail {
+ ///   - macOS x86_64:    4KB granularity  -> no offset
+ ///   - Linux (any):     4KB granularity  -> no offset (mmap handles it natively)
+ constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
+-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && defined(__aarch64__))
++#if REX_PLATFORM_PS5 || REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && defined(__aarch64__))
+   return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
+ #else
+   return 0u;
+@@ -324,6 +324,9 @@ class PhysicalHeap : public BaseHeap {
+ 
+  protected:
+   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
++  // Whether the guest can write to any of its pages within a host (system)
++  // page. Host pages may hold several guest pages (16 KB host pages on PS5).
++  bool IsSystemPageGuestWritable(uint32_t system_page) const;
+ 
+   // Allocation on these heaps delegates to parent_heap_, whose own reconcile
+   // pass takes the global critical region. Acquire whenever this heap or its
+diff --git a/include/rex/system/xthread.h b/include/rex/system/xthread.h
+index a72911e..f432aa8 100644
+--- a/include/rex/system/xthread.h
++++ b/include/rex/system/xthread.h
+@@ -375,7 +375,7 @@ class XThread : public XObject {
+   uint32_t suspend_count();
+   X_STATUS Resume(uint32_t* out_suspend_count = nullptr);
+   X_STATUS Suspend(uint32_t* out_suspend_count = nullptr);
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5
+   // Increment suspend count and block until another thread resumes us.
+   uint32_t SelfSuspend();
+ #endif
+@@ -427,7 +427,7 @@ class XThread : public XObject {
+ 
+   int32_t priority_ = 0;
+ 
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5
+   std::mutex suspend_mutex_;
+   std::condition_variable suspend_cv_;
+ #endif
+diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
+index 352af67..5679e81 100644
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -14,7 +14,7 @@
+ #include <rex/platform.h>
+ #include <cstddef>
+ 
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5
+ #if REX_PLATFORM_MAC && !defined(_XOPEN_SOURCE)
+ // Darwin hides the deprecated ucontext APIs unless _XOPEN_SOURCE is defined
+ // before including <ucontext.h>.
+@@ -56,8 +56,18 @@ struct Fiber {
+ #if REX_PLATFORM_WIN32
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
+-#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5
++#if REX_PLATFORM_PS5
++  // Firmware 9.00 getcontext reports mc_len=1152 and writes 1216 bytes.
++  // The SDK's register prefix is correct, but its 928-byte ucontext_t is
++  // truncated. Keep the native context isolated from C++ object members.
++  struct alignas(64) NativeContext {
++    ucontext_t prefix{};
++    unsigned char extension[2048 - sizeof(ucontext_t)]{};
++  } context_;
++#else
+   ucontext_t context_{};
++#endif
+   std::vector<uint8_t> stack_;
+   void (*entry_)(void*) = nullptr;
+   void* arg_ = nullptr;
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30..b16f165 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -716,6 +716,10 @@ class Presenter {
+   // Call via PaintAndPresent.
+   virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers) = 0;
+ 
++  // Stops the frame pacing thread; implementations call it before destroying
++  // anything the thread may be painting with.
++  void ShutdownFramePacing();
++
+   // For calling from the painting implementations if requested.
+   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
+ 
+@@ -977,6 +981,26 @@ class Presenter {
+   // rather than being blank.
+   bool guest_output_active_last_refresh_ = false;
+ 
++  // Frame pacing (cvar present_frame_pacing). With FIFO presentation, a
++  // dedicated thread presents once per display refresh: a new guest frame only
++  // after the current one has been on screen for its whole guest frame interval
++  // (two refreshes at 30 FPS), otherwise the current frame again. Frames then
++  // stay on screen for even durations instead of the guest output thread's
++  // present timing deciding, and that thread never waits for the display.
++  void FramePacingThread();
++  std::thread frame_pacing_thread_;
++  std::mutex frame_pacing_mutex_;
++  std::condition_variable frame_pacing_condition_;
++  // Guarded by frame_pacing_mutex_.
++  bool frame_pacing_shutdown_ = false;
++  uint64_t frame_pacing_published_ = 0;
++  double frame_pacing_interval_ms_ = 1000.0 / 30.0;
++  uint64_t frame_pacing_last_publish_ns_ = 0;
++  // Set by the pacing thread, with paint_mode_mutex_ held, while it presents
++  // the current guest output again; makes ConsumeGuestOutput keep the
++  // acquired image instead of taking a newer ready one.
++  bool consume_hold_ = false;
++
+   // Ordered by the Z order, and then by the time of addition.
+   // Note: All the iteration logic involving this Z ordering must be the same as
+   // in input handling (in the input listeners in the Window), but in reverse.
+diff --git a/include/rex/ui/renderdoc_api.h b/include/rex/ui/renderdoc_api.h
+index 536f710..ba5cf76 100644
+--- a/include/rex/ui/renderdoc_api.h
++++ b/include/rex/ui/renderdoc_api.h
+@@ -14,7 +14,7 @@
+ 
+ #include <rex/platform/dynlib.h>
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
+ struct RENDERDOC_API_1_0_0;
+ #else
+ #include <renderdoc_app.h>
+diff --git a/include/rex/ui/surface.h b/include/rex/ui/surface.h
+index a302000..9616959 100644
+--- a/include/rex/ui/surface.h
++++ b/include/rex/ui/surface.h
+@@ -36,6 +36,8 @@ class Surface {
+     kTypeIndex_Win32Hwnd,
+     // macOS — CAMetalLayer presented via MoltenVK (VK_EXT_metal_surface).
+     kTypeIndex_CAMetalLayer,
++    // PS5 native VideoOut plane exposed by RADV through VK_KHR_display.
++    kTypeIndex_PS5Display,
+   };
+   using TypeFlags = uint32_t;
+   enum : TypeFlags {
+@@ -44,6 +46,7 @@ class Surface {
+     kTypeFlag_XcbWindow = TypeFlags(1) << kTypeIndex_XcbWindow,
+     kTypeFlag_Win32Hwnd = TypeFlags(1) << kTypeIndex_Win32Hwnd,
+     kTypeFlag_CAMetalLayer = TypeFlags(1) << kTypeIndex_CAMetalLayer,
++    kTypeFlag_PS5Display = TypeFlags(1) << kTypeIndex_PS5Display,
+   };
+ 
+   Surface(const Surface& surface) = delete;
+diff --git a/include/rex/ui/surface_ps5.h b/include/rex/ui/surface_ps5.h
+new file mode 100644
+index 0000000..cb41f03
+--- /dev/null
++++ b/include/rex/ui/surface_ps5.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <rex/ui/surface.h>
++
++namespace rex::ui {
++
++class PS5DisplaySurface final : public Surface {
++ public:
++  explicit PS5DisplaySurface(uint32_t width = 1920, uint32_t height = 1080)
++      : width_(width), height_(height) {}
++  TypeIndex GetType() const override { return kTypeIndex_PS5Display; }
++
++ protected:
++  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override {
++    width_out = width_;
++    height_out = height_;
++    return true;
++  }
++
++ private:
++  uint32_t width_;
++  uint32_t height_;
++};
++
++}  // namespace rex::ui
+diff --git a/include/rex/ui/vulkan/functions/instance_khr_display.inc b/include/rex/ui/vulkan/functions/instance_khr_display.inc
+new file mode 100644
+index 0000000..c76a138
+--- /dev/null
++++ b/include/rex/ui/vulkan/functions/instance_khr_display.inc
+@@ -0,0 +1,6 @@
++XE_UI_VULKAN_FUNCTION(vkGetPhysicalDeviceDisplayPropertiesKHR)
++XE_UI_VULKAN_FUNCTION(vkGetDisplayModePropertiesKHR)
++XE_UI_VULKAN_FUNCTION(vkGetPhysicalDeviceDisplayPlanePropertiesKHR)
++XE_UI_VULKAN_FUNCTION(vkGetDisplayPlaneSupportedDisplaysKHR)
++XE_UI_VULKAN_FUNCTION(vkGetDisplayPlaneCapabilitiesKHR)
++XE_UI_VULKAN_FUNCTION(vkCreateDisplayPlaneSurfaceKHR)
+diff --git a/include/rex/ui/vulkan/instance.h b/include/rex/ui/vulkan/instance.h
+index 4edde2b..372888d 100644
+--- a/include/rex/ui/vulkan/instance.h
++++ b/include/rex/ui/vulkan/instance.h
+@@ -55,6 +55,8 @@ class VulkanInstance {
+ #include <rex/ui/vulkan/functions/instance_1_0.inc>
+     // VK_KHR_surface (#1)
+ #include <rex/ui/vulkan/functions/instance_khr_surface.inc>
++    // VK_KHR_display (#3)
++#include <rex/ui/vulkan/functions/instance_khr_display.inc>
+     // VK_KHR_xcb_surface (#6)
+ #ifdef VK_USE_PLATFORM_XCB_KHR
+ #include <rex/ui/vulkan/functions/instance_khr_xcb_surface.inc>
+@@ -91,6 +93,7 @@ class VulkanInstance {
+   // supported (with the `ext_major_minor_` prefix rather than `ext_`).
+   struct Extensions {
+     bool ext_KHR_surface = false;  // #1
++    bool ext_KHR_display = false;  // #3
+ #ifdef VK_USE_PLATFORM_XCB_KHR
+     bool ext_KHR_xcb_surface = false;  // #6
+ #endif
+diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
+index 68274d2..d7ae7b8 100644
+--- a/resources/templates/codegen/pch_h.inja
++++ b/resources/templates/codegen/pch_h.inja
+@@ -124,7 +124,7 @@ extern PPCFuncMapping PPCFuncMappings[];
+ // Memory Access
+ //=============================================================================
+ 
+-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
++#if REX_PLATFORM_PS5 || REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
+ #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
+ #else
+ #define REX_PHYS_HOST_OFFSET(addr) 0u
+diff --git a/resources/templates/test/ppc_config_h.inja b/resources/templates/test/ppc_config_h.inja
+index 0c334f8..2f11d56 100644
+--- a/resources/templates/test/ppc_config_h.inja
++++ b/resources/templates/test/ppc_config_h.inja
+@@ -73,7 +73,7 @@
+ #endif
+ #endif
+ 
+-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
++#if REX_PLATFORM_PS5 || REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
+ #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
+ #else
+ #define REX_PHYS_HOST_OFFSET(addr) 0u
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1ddafd0..82f3acd 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -24,7 +24,9 @@ add_library(rexcore OBJECT
+ )
+ add_library(rex::core ALIAS rexcore)
+ 
+-if(APPLE)
++if(PS5)
++    target_link_libraries(rexcore PRIVATE pthread dl)
++elseif(APPLE)
+     # Apple's libc++ still gates std::jthread/std::stop_token behind the
+     # experimental-library feature flag. Only timer_queue.cpp uses them, and
+     # neither type crosses a header boundary.
+@@ -66,7 +68,6 @@ elseif(UNIX)
+         fiber_posix.cpp
+         mapped_memory_posix.cpp
+         math_gcc.cpp
+-        memory_posix.cpp
+         platform/console_posix.cpp
+         platform/env_posix.cpp
+         seh_posix.cpp
+@@ -135,3 +136,9 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
+     target_compile_definitions(rexcore PUBLIC
+         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
+ endif()
++
++if(PS5)
++    target_sources(rexcore PRIVATE memory_ps5.cpp)
++elseif(UNIX)
++    target_sources(rexcore PRIVATE memory_posix.cpp)
++endif()
+diff --git a/src/core/atomic_posix.cpp b/src/core/atomic_posix.cpp
+index 378aa4b..88227bf 100644
+--- a/src/core/atomic_posix.cpp
++++ b/src/core/atomic_posix.cpp
+@@ -1,7 +1,8 @@
+ #include <rex/platform.h>
+ #include <rex/thread/atomic.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5,
++              "This file is POSIX-only");
+ 
+ namespace rex::thread {
+ 
+diff --git a/src/core/clock_posix.cpp b/src/core/clock_posix.cpp
+index 00f2382..9a361d1 100644
+--- a/src/core/clock_posix.cpp
++++ b/src/core/clock_posix.cpp
+@@ -10,7 +10,8 @@
+ #include <rex/chrono/clock.h>
+ #include <rex/platform.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5,
++              "This file is POSIX-only");
+ 
+ #include <sys/time.h>
+ 
+@@ -21,13 +22,21 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ namespace rex::chrono {
+ 
+ uint64_t Clock::host_tick_frequency_platform() {
+-#ifdef __APPLE__
++#if REX_PLATFORM_PS5
++  // clock_gettime returns nanoseconds regardless of clock_getres precision.
++  // Using 1e9 / resolution with nanosecond counts accelerates guest time.
++  return 1000000000ull;
++#elif defined(__APPLE__)
+   mach_timebase_info_data_t info;
+   mach_timebase_info(&info);
+   return (uint64_t)((1000000000ull * (uint64_t)info.denom) / (uint64_t)info.numer);
+ #else
+   timespec res;
++#if REX_PLATFORM_PS5
++  int error = clock_getres(CLOCK_MONOTONIC, &res);
++#else
+   int error = clock_getres(CLOCK_MONOTONIC_RAW, &res);
++#endif
+   assert_zero(error);
+   assert_zero(res.tv_sec);  // Sub second resolution is required.
+ 
+@@ -45,7 +54,11 @@ uint64_t Clock::host_tick_count_platform() {
+   return mach_absolute_time();
+ #else
+   timespec tp;
++#if REX_PLATFORM_PS5
++  int error = clock_gettime(CLOCK_MONOTONIC, &tp);
++#else
+   int error = clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
++#endif
+   assert_zero(error);
+ 
+   return tp.tv_nsec + tp.tv_sec * 1000000000ull;
+diff --git a/src/core/dynlib_posix.cpp b/src/core/dynlib_posix.cpp
+index fcfd6c9..5008222 100644
+--- a/src/core/dynlib_posix.cpp
++++ b/src/core/dynlib_posix.cpp
+@@ -1,7 +1,8 @@
+ #include <rex/platform.h>
+ #include <rex/platform/dynlib.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5,
++              "This file is POSIX-only");
+ 
+ #include <dlfcn.h>
+ 
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index 8b1c76a..38a1db4 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -17,7 +17,7 @@
+ 
+ #include <rex/exception_handler.h>
+ 
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5
+ 
+ #include <signal.h>
+ 
+@@ -30,6 +30,9 @@
+ #include <rex/platform.h>
+ 
+ #include <ucontext.h>
++#if REX_PLATFORM_PS5
++#include <unistd.h>
++#endif
+ 
+ namespace rex::arch {
+ 
+@@ -85,6 +88,29 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+   thread_context.r15 = uint64_t(mcontext->__ss.__r15);
+   std::memcpy(thread_context.xmm_registers, &mcontext->__fs.__fpu_xmm0,
+               sizeof(thread_context.xmm_registers));
++#elif REX_PLATFORM_PS5
++  thread_context.rip = uint64_t(mcontext.mc_rip);
++  thread_context.eflags = uint32_t(mcontext.mc_rflags);
++  thread_context.rax = uint64_t(mcontext.mc_rax);
++  thread_context.rcx = uint64_t(mcontext.mc_rcx);
++  thread_context.rdx = uint64_t(mcontext.mc_rdx);
++  thread_context.rbx = uint64_t(mcontext.mc_rbx);
++  thread_context.rsp = uint64_t(mcontext.mc_rsp);
++  thread_context.rbp = uint64_t(mcontext.mc_rbp);
++  thread_context.rsi = uint64_t(mcontext.mc_rsi);
++  thread_context.rdi = uint64_t(mcontext.mc_rdi);
++  thread_context.r8 = uint64_t(mcontext.mc_r8);
++  thread_context.r9 = uint64_t(mcontext.mc_r9);
++  thread_context.r10 = uint64_t(mcontext.mc_r10);
++  thread_context.r11 = uint64_t(mcontext.mc_r11);
++  thread_context.r12 = uint64_t(mcontext.mc_r12);
++  thread_context.r13 = uint64_t(mcontext.mc_r13);
++  thread_context.r14 = uint64_t(mcontext.mc_r14);
++  thread_context.r15 = uint64_t(mcontext.mc_r15);
++  // FreeBSD's amd64 savefpu layout places the sixteen XMM registers at 160.
++  std::memcpy(thread_context.xmm_registers,
++              reinterpret_cast<const uint8_t*>(mcontext.mc_fpstate) + 160,
++              sizeof(thread_context.xmm_registers));
+ #else
+   thread_context.rip = uint64_t(mcontext.gregs[REG_RIP]);
+   thread_context.eflags = uint32_t(mcontext.gregs[REG_EFL]);
+@@ -187,6 +213,10 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       access_violation_operation = (uint64_t(mcontext->__es.__err) & kX86PageFaultErrorCodeWrite)
+                                        ? Exception::AccessViolationOperation::kWrite
+                                        : Exception::AccessViolationOperation::kRead;
++#elif REX_PLATFORM_PS5
++      access_violation_operation = (uint64_t(mcontext.mc_err) & kX86PageFaultErrorCodeWrite)
++                                       ? Exception::AccessViolationOperation::kWrite
++                                       : Exception::AccessViolationOperation::kRead;
+ #else
+       access_violation_operation = (uint64_t(mcontext.gregs[REG_ERR]) & kX86PageFaultErrorCodeWrite)
+                                        ? Exception::AccessViolationOperation::kWrite
+@@ -331,6 +361,41 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+                         modified_register_index * sizeof(vec128_t),
+                     &thread_context.xmm_registers[modified_register_index], sizeof(vec128_t));
+       }
++#elif REX_PLATFORM_PS5
++      mcontext.mc_rip = thread_context.rip;
++      mcontext.mc_rflags = thread_context.eflags;
++      uint32_t modified_register_index;
++      uint64_t* const int_registers[] = {
++          reinterpret_cast<uint64_t*>(&mcontext.mc_rax),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_rcx),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_rdx),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_rbx),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_rsp),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_rbp),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_rsi),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_rdi),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_r8),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_r9),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_r10),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_r11),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_r12),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_r13),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_r14),
++          reinterpret_cast<uint64_t*>(&mcontext.mc_r15),
++      };
++      uint16_t modified_int_registers_remaining = ex.modified_int_registers();
++      while (rex::bit_scan_forward(modified_int_registers_remaining, &modified_register_index)) {
++        modified_int_registers_remaining &= ~(UINT16_C(1) << modified_register_index);
++        *int_registers[modified_register_index] =
++            thread_context.int_registers[modified_register_index];
++      }
++      uint16_t modified_xmm_registers_remaining = ex.modified_xmm_registers();
++      while (rex::bit_scan_forward(modified_xmm_registers_remaining, &modified_register_index)) {
++        modified_xmm_registers_remaining &= ~(UINT16_C(1) << modified_register_index);
++        std::memcpy(reinterpret_cast<uint8_t*>(mcontext.mc_fpstate) + 160 +
++                        modified_register_index * sizeof(vec128_t),
++                    &thread_context.xmm_registers[modified_register_index], sizeof(vec128_t));
++      }
+ #else
+       mcontext.gregs[REG_RIP] = greg_t(thread_context.rip);
+       mcontext.gregs[REG_EFL] = greg_t(thread_context.eflags);
+@@ -417,6 +482,19 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       return;
+     }
+   }
++#if REX_PLATFORM_PS5
++  // Never retry an unhandled fault indefinitely. Returning with the original
++  // context faults again, so restore the previous disposition for that retry.
++  const char message[] = "[Naruto] unhandled host fault; restoring signal disposition\n";
++  (void)write(STDERR_FILENO, message, sizeof(message) - 1);
++  struct sigaction previous = signal_number == SIGILL ? original_sigill_handler_
++                                                     : original_sigsegv_handler_;
++  if (previous.sa_handler == SIG_IGN) {
++    previous.sa_handler = SIG_DFL;
++    previous.sa_flags = 0;
++  }
++  sigaction(signal_number, &previous, nullptr);
++#endif
+ }
+ 
+ void ExceptionHandler::Install(Handler fn, void* data) {
+diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
+index 4fe1ca6..38322c8 100644
+--- a/src/core/fiber_posix.cpp
++++ b/src/core/fiber_posix.cpp
+@@ -17,11 +17,12 @@
+ #endif
+ 
+ #include <rex/platform.h>
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5
+ 
+ #include <rex/thread/fiber.h>
+ 
+ #include <cassert>
++#include <cstdlib>
+ 
+ namespace rex::thread {
+ 
+@@ -29,7 +30,13 @@ thread_local Fiber* Fiber::tls_current_ = nullptr;
+ 
+ Fiber* Fiber::ConvertCurrentThread() {
+   auto* f = new Fiber();
+-  if (getcontext(&f->context_) == -1) {
++  if (getcontext(
++#if REX_PLATFORM_PS5
++          &f->context_.prefix
++#else
++          &f->context_
++#endif
++          ) == -1) {
+     delete f;
+     return nullptr;
+   }
+@@ -39,20 +46,40 @@ Fiber* Fiber::ConvertCurrentThread() {
+ }
+ 
+ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
++#if REX_PLATFORM_PS5
++  if (stack_size < 16384 || entry == nullptr) return nullptr;
++#endif
+   auto* f = new Fiber();
+   f->entry_ = entry;
+   f->arg_ = arg;
+   f->stack_.resize(stack_size);
+ 
+-  if (getcontext(&f->context_) == -1) {
++  if (getcontext(
++#if REX_PLATFORM_PS5
++          &f->context_.prefix
++#else
++          &f->context_
++#endif
++          ) == -1) {
+     delete f;
+     return nullptr;
+   }
++#if REX_PLATFORM_PS5
++  // Seed the SysV x86-64 entry stack directly. makecontext from libc uses
++  // context fields beyond the SDK's truncated layout; do not use those fields.
++  uintptr_t top = reinterpret_cast<uintptr_t>(f->stack_.data() + f->stack_.size());
++  top = (top & ~uintptr_t(15)) - sizeof(uintptr_t);
++  *reinterpret_cast<uintptr_t*>(top) = 0;
++  f->context_.prefix.uc_mcontext.mc_rsp = top;
++  f->context_.prefix.uc_mcontext.mc_rbp = 0;
++  f->context_.prefix.uc_mcontext.mc_rip = reinterpret_cast<uintptr_t>(&Fiber::Trampoline);
++#else
+   f->context_.uc_stack.ss_sp = f->stack_.data();
+   f->context_.uc_stack.ss_size = f->stack_.size();
+   f->context_.uc_link = nullptr;
+   // Trampoline reads entry_/arg_ from tls_current_ — no pointer splitting needed.
+   makecontext(&f->context_, &Fiber::Trampoline, 0);
++#endif
+   return f;
+ }
+ 
+@@ -60,12 +87,20 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
+   // tls_current_ was updated by SwitchTo before swapcontext returned here.
+   Fiber* f = tls_current_;
+   f->entry_(f->arg_);
++#if REX_PLATFORM_PS5
++  std::abort();  // Fiber entries must switch back to their owner before returning.
++#endif
+ }
+ 
+ void Fiber::SwitchTo(Fiber* target) {
+   Fiber* from = tls_current_;
+   tls_current_ = target;
++#if REX_PLATFORM_PS5
++  if (swapcontext(&from->context_.prefix, &target->context_.prefix) == -1)
++    std::abort();
++#else
+   swapcontext(&from->context_, &target->context_);
++#endif
+ }
+ 
+ void Fiber::Destroy() {
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+index ef5bdf4..1ba0ad1 100644
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -20,7 +20,7 @@
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(__PROSPERO__)
+ #include <mach-o/dyld.h>
+ #endif
+ 
+@@ -37,7 +37,7 @@
+ 
+ // macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
+ // explicit *64 forms for legacy 32-bit off_t distributions.
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || REX_PLATFORM_PS5
+ using rex_off64_t = off_t;
+ #define rex_fseeko64 fseeko
+ #define rex_ftello64 ftello
+@@ -70,7 +70,9 @@ std::filesystem::path to_path(const std::u16string_view source) {
+ namespace filesystem {
+ 
+ std::filesystem::path GetExecutablePath() {
+-#if defined(__APPLE__)
++#if REX_PLATFORM_PS5
++  return "/app0/eboot.bin";
++#elif defined(__APPLE__)
+   // Darwin has no /proc; query the executable path via the dyld API. The first
+   // call reports the required buffer size.
+   uint32_t executable_path_size = 0;
+@@ -104,6 +106,9 @@ std::filesystem::path GetExecutableFolder() {
+ }
+ 
+ std::filesystem::path GetUserFolder() {
++#if REX_PLATFORM_PS5
++  return "/app0/user";
++#else
+   // get preferred data home
+   if (auto xdg = rex::platform::env::get("XDG_DATA_HOME")) {
+     return std::filesystem::path(*xdg);
+@@ -121,6 +126,7 @@ std::filesystem::path GetUserFolder() {
+   getpwuid_r(getuid(), &pw1, buf, sizeof(buf), &pw);
+   assert(&pw1 == pw);  // sanity check
+   return std::filesystem::path(pw->pw_dir) / ".local" / "share";
++#endif
+ }
+ 
+ FILE* OpenFile(const std::filesystem::path& path, const std::string_view mode) {
+@@ -190,6 +196,15 @@ class PosixFileHandle : public FileHandle {
+   bool Read(size_t file_offset, void* buffer, size_t buffer_length,
+             size_t* out_bytes_read) override {
+     ssize_t out = pread(handle_, buffer, buffer_length, file_offset);
++#if REX_PLATFORM_PS5
++    if (path().filename() == "Save.dat") {
++      uint32_t hash = 2166136261u;
++      for (ssize_t i = 0; i < out; ++i)
++        hash = (hash ^ static_cast<const uint8_t*>(buffer)[i]) * 16777619u;
++      REXFS_INFO("Save read: path={} offset={} requested={} actual={} hash={:08X}",
++                 path().string(), file_offset, buffer_length, out, hash);
++    }
++#endif
+     if (out < 0) {
+       *out_bytes_read = 0;
+       return false;
+diff --git a/src/core/mapped_memory_posix.cpp b/src/core/mapped_memory_posix.cpp
+index 8ee8e34..74bdb2c 100644
+--- a/src/core/mapped_memory_posix.cpp
++++ b/src/core/mapped_memory_posix.cpp
+@@ -23,7 +23,7 @@
+ // macOS off_t is 64-bit and provides no *64 large-file variants; the base
+ // names already are the large-file interfaces. Linux still ships legacy 32-bit
+ // off_t on some distributions, so keep the explicit *64 forms there.
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || REX_PLATFORM_PS5
+ using rex_stat64_t = struct stat;
+ using rex_off64_t = off_t;
+ #define rex_fstat64 fstat
+diff --git a/src/core/math_gcc.cpp b/src/core/math_gcc.cpp
+index 1ec7192..8c763ac 100644
+--- a/src/core/math_gcc.cpp
++++ b/src/core/math_gcc.cpp
+@@ -34,7 +34,7 @@ uint8_t tzcnt(uint64_t v) {
+ }
+ 
+ bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
+-  int i = ffs(v);
++  int i = __builtin_ffs(static_cast<int>(v));
+   *out_first_set_index = i - 1;
+   return i != 0;
+ }
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index e0a949b..7e8fbb2 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -38,7 +38,7 @@
+ 
+ // macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
+ // explicit *64 forms for legacy 32-bit off_t distributions.
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || REX_PLATFORM_PS5
+ #define rex_mmap64 mmap
+ #define rex_ftruncate64 ftruncate
+ #else
+diff --git a/src/core/memory_ps5.cpp b/src/core/memory_ps5.cpp
+new file mode 100644
+index 0000000..78b2035
+--- /dev/null
++++ b/src/core/memory_ps5.cpp
+@@ -0,0 +1,317 @@
++// PS5 direct-memory backing for ReXGlue's sparse, aliased guest arena.
++// Uses the existing PS5 platform allocator; each backing unit is shared by
++// every guest alias and is allocated only at its first explicit commit.
++#include <rex/memory/utils.h>
++#include <ps5platform/kernel.h>
++#include <ps5platform/shm.h>
++#include <algorithm>
++#include <limits>
++#include <map>
++#include <set>
++#include <memory>
++#include <mutex>
++#include <vector>
++
++namespace rex::memory {
++namespace {
++constexpr size_t kPage = 0x4000;
++constexpr size_t kUnit = 0x10000;
++struct View {
++  uintptr_t base;
++  size_t size, offset;
++  std::vector<PageAccess> access;
++  std::set<size_t> mapped;
++};
++struct Mapping {
++  size_t size;
++  std::vector<View> views;
++  std::map<size_t, ps5_shm> units;
++};
++std::recursive_mutex arena_mutex;
++std::map<FileMappingHandle, std::unique_ptr<Mapping>> mappings;
++std::map<uintptr_t, size_t> private_ranges;
++size_t RoundUp(size_t value, size_t align) { return (value + align - 1) & ~(align - 1); }
++int Protection(PageAccess access) {
++  switch (access) {
++    case PageAccess::kNoAccess: return 0;
++    case PageAccess::kReadOnly: return PS5_SHM_READ;
++    case PageAccess::kReadWrite: return PS5_SHM_READ | PS5_SHM_WRITE;
++    case PageAccess::kExecuteReadOnly: return PS5_SHM_READ | PS5_SHM_EXEC;
++    case PageAccess::kExecuteReadWrite: return PS5_SHM_READ | PS5_SHM_WRITE | PS5_SHM_EXEC;
++  }
++  return 0;
++}
++bool Contains(uintptr_t base, size_t bytes, uintptr_t address, size_t length) {
++  return address >= base && address - base <= bytes && length <= bytes - (address - base);
++}
++bool FindView(uintptr_t address, size_t length, Mapping*& mapping, View*& view) {
++  for (auto& [handle, candidate] : mappings) {
++    for (auto& v : candidate->views) {
++      if (Contains(v.base, v.size, address, length)) {
++        mapping = candidate.get(); view = &v; return true;
++      }
++    }
++  }
++  return false;
++}
++bool MapUnit(View& view, size_t offset, const ps5_shm& unit) {
++  if (offset < view.offset || offset - view.offset >= view.size) return true;
++  const size_t relative = offset - view.offset;
++  void* desired = reinterpret_cast<void*>(view.base + relative);
++  void* actual = nullptr;
++  if (ps5_shm_map(&unit, 0, kUnit, desired, PS5_SHM_READ | PS5_SHM_WRITE,
++                  PS5_SHM_FIXED, &actual) != 0) return false;
++  if (actual != desired) return false;
++  view.mapped.insert(offset);
++  for (size_t page = 0; page < kUnit / kPage; ++page) {
++    auto access = view.access[relative / kPage + page];
++    if (access != PageAccess::kReadWrite &&
++        sceKernelMprotect(reinterpret_cast<void*>(view.base + relative + page * kPage),
++                          kPage, Protection(access)) != 0) return false;
++  }
++  return true;
++}
++bool EnsureBacking(Mapping& mapping, size_t offset, size_t length) {
++  const size_t begin = offset & ~(kUnit - 1);
++  const size_t end = RoundUp(offset + length, kUnit);
++  for (size_t unit_offset = begin; unit_offset < end; unit_offset += kUnit) {
++    if (mapping.units.contains(unit_offset)) continue;
++    ps5_shm unit{};
++    if (ps5_shm_create(kUnit, &unit) != 0) return false;
++    auto [entry, inserted] = mapping.units.emplace(unit_offset, unit);
++    for (auto& view : mapping.views) {
++      if (!MapUnit(view, unit_offset, entry->second)) {
++        for (auto& rollback : mapping.views) {
++          if (rollback.mapped.erase(unit_offset))
++            ps5_shm_unmap(reinterpret_cast<void*>(rollback.base + unit_offset - rollback.offset),
++                          kUnit, PS5_SHM_KEEP_RESERVED);
++        }
++        ps5_shm_destroy(&entry->second);
++        mapping.units.erase(entry);
++        return false;
++      }
++    }
++  }
++  return true;
++}
++bool SetViewAccess(Mapping& mapping, View& view, uintptr_t address, size_t length,
++                   PageAccess access, bool commit) {
++  const uintptr_t begin = address & ~(kPage - 1);
++  const uintptr_t end = RoundUp(address + length, kPage);
++  if (!Contains(view.base, view.size, begin, end - begin)) return false;
++  const size_t first_unit = (view.offset + begin - view.base) & ~(kUnit - 1);
++  const size_t last_unit = RoundUp(view.offset + end - view.base, kUnit);
++  std::vector<size_t> newly_backed;
++  if (commit) {
++    for (size_t offset = first_unit; offset < last_unit; offset += kUnit)
++      if (!mapping.units.contains(offset)) newly_backed.push_back(offset);
++  }
++  auto rollback_backing = [&] {
++    for (size_t offset : newly_backed) {
++      auto found = mapping.units.find(offset);
++      if (found == mapping.units.end()) continue;
++      for (auto& alias : mapping.views) {
++        if (alias.mapped.erase(offset))
++          ps5_shm_unmap(reinterpret_cast<void*>(alias.base + offset - alias.offset),
++                        kUnit, PS5_SHM_KEEP_RESERVED);
++      }
++      ps5_shm_destroy(&found->second);
++      mapping.units.erase(found);
++    }
++  };
++  if (commit && !EnsureBacking(mapping, view.offset + begin - view.base, end - begin)) {
++    rollback_backing(); return false;
++  }
++  // Write watches protect and unprotect long page runs on every upload, so skip
++  // pages already at the requested access and change each run of consecutive
++  // backed pages with a single call.
++  std::vector<std::pair<size_t, PageAccess>> changed;  // page index, previous access
++  uintptr_t run_begin = 0;
++  size_t run_pages = 0;
++  auto flush_run = [&] {
++    if (!run_pages) return true;
++    const bool ok = sceKernelMprotect(reinterpret_cast<void*>(run_begin), run_pages * kPage,
++                                      Protection(access)) == 0;
++    run_pages = 0;
++    return ok;
++  };
++  auto fail = [&] {
++    for (auto it = changed.rbegin(); it != changed.rend(); ++it) {
++      const uintptr_t old_page = view.base + it->first * kPage;
++      const size_t old_offset = view.offset + it->first * kPage;
++      if (mapping.units.contains(old_offset & ~(kUnit - 1)))
++        if (sceKernelMprotect(reinterpret_cast<void*>(old_page), kPage,
++                              Protection(it->second)) != 0) std::abort();
++      view.access[it->first] = it->second;
++    }
++    rollback_backing();
++    return false;
++  };
++  size_t cached_unit = SIZE_MAX;
++  bool cached_unit_backed = false;
++  for (uintptr_t page = begin; page < end; page += kPage) {
++    const size_t index = (page - view.base) / kPage;
++    const size_t unit = (view.offset + page - view.base) & ~(kUnit - 1);
++    if (unit != cached_unit) {
++      cached_unit = unit;
++      cached_unit_backed = mapping.units.contains(unit);
++    }
++    const PageAccess old_access = view.access[index];
++    if (old_access == access) {
++      if (!flush_run()) return fail();
++      continue;
++    }
++    changed.emplace_back(index, old_access);
++    view.access[index] = access;
++    if (!cached_unit_backed) {
++      if (!flush_run()) return fail();
++      continue;
++    }
++    if (run_pages && run_begin + run_pages * kPage == page) {
++      ++run_pages;
++    } else {
++      if (!flush_run()) return fail();
++      run_begin = page;
++      run_pages = 1;
++    }
++  }
++  if (!flush_run()) return fail();
++  return true;
++}
++}  // namespace
++
++size_t page_size() { return kPage; }
++size_t allocation_granularity() { return kUnit; }
++bool IsWritableExecutableMemorySupported() { return true; }
++
++void* AllocFixed(void* address, size_t length, AllocationType type, PageAccess access) {
++  if (!length || length > std::numeric_limits<size_t>::max() - kUnit) return nullptr;
++  std::lock_guard lock(arena_mutex);
++  const uintptr_t start = reinterpret_cast<uintptr_t>(address);
++  Mapping* mapping = nullptr; View* view = nullptr;
++  if (address && FindView(start, length, mapping, view)) {
++    if (type == AllocationType::kReserve) return address;
++    return SetViewAccess(*mapping, *view, start, length, access, true) ? address : nullptr;
++  }
++  for (auto [base, bytes] : private_ranges) {
++    if (address && Contains(base, bytes, start, length)) {
++      if (type == AllocationType::kReserve) return address;
++      return ps5_vrange_commit(address, length, Protection(access)) == 0 ? address : nullptr;
++    }
++  }
++  void* base = address;
++  const size_t bytes = RoundUp(length, kUnit);
++  int result = address ? ps5_vrange_reserve_at(address, bytes)
++                       : ps5_vrange_reserve(bytes, nullptr, kUnit, &base);
++  if (result) return nullptr;
++  if (type != AllocationType::kReserve && ps5_vrange_commit(base, length, Protection(access))) {
++    ps5_vrange_release(base, bytes); return nullptr;
++  }
++  private_ranges.emplace(reinterpret_cast<uintptr_t>(base), bytes);
++  return base;
++}
++
++bool DeallocFixed(void* address, size_t length, DeallocationType type) {
++  std::lock_guard lock(arena_mutex);
++  const auto start = reinterpret_cast<uintptr_t>(address);
++  Mapping* mapping = nullptr; View* view = nullptr;
++  if (FindView(start, length ? length : 1, mapping, view)) {
++    // Guest heap disposal must not release an alias owned by the arena. Shared
++    // backing remains owned until UnmapFileView / CloseFileMappingHandle.
++    if (type == DeallocationType::kRelease && !length) return true;
++    return SetViewAccess(*mapping, *view, start, length, PageAccess::kNoAccess, false);
++  }
++  auto found = private_ranges.find(start);
++  if (type == DeallocationType::kRelease) {
++    if (found == private_ranges.end()) return false;
++    if (ps5_vrange_release(address, found->second)) return false;
++    private_ranges.erase(found); return true;
++  }
++  return length && ps5_vrange_decommit(address, length) == 0;
++}
++
++bool QueryProtect(void* address, size_t& length, PageAccess& access) {
++  void* begin = nullptr; void* end = nullptr; uint32_t protection = 0;
++  length = 0; access = PageAccess::kNoAccess;
++  if (sceKernelQueryMemoryProtection(address, &begin, &end, &protection) != 0) return false;
++  if (reinterpret_cast<uintptr_t>(end) <= reinterpret_cast<uintptr_t>(address)) return false;
++  length = reinterpret_cast<uintptr_t>(end) - reinterpret_cast<uintptr_t>(address);
++  if (protection & PS5_SHM_EXEC)
++    access = protection & PS5_SHM_WRITE ? PageAccess::kExecuteReadWrite : PageAccess::kExecuteReadOnly;
++  else if (protection & PS5_SHM_WRITE) access = PageAccess::kReadWrite;
++  else if (protection & PS5_SHM_READ) access = PageAccess::kReadOnly;
++  return true;
++}
++
++bool Protect(void* address, size_t length, PageAccess access, PageAccess* previous) {
++  if (!length) return false;
++  if (previous) { size_t old_length; if (!QueryProtect(address, old_length, *previous)) return false; }
++  std::lock_guard lock(arena_mutex);
++  const auto start = reinterpret_cast<uintptr_t>(address);
++  Mapping* mapping = nullptr; View* view = nullptr;
++  if (FindView(start, length, mapping, view))
++    return SetViewAccess(*mapping, *view, start, length, access, access != PageAccess::kNoAccess);
++  const auto begin = start & ~(kPage - 1);
++  return sceKernelMprotect(reinterpret_cast<void*>(begin), RoundUp(start + length, kPage) - begin,
++                           Protection(access)) == 0;
++}
++
++FileMappingHandle CreateFileMappingHandle(const std::filesystem::path&, size_t length,
++                                          PageAccess, bool) {
++  if (!length || length > std::numeric_limits<size_t>::max() - kUnit) return kFileMappingHandleInvalid;
++  std::lock_guard lock(arena_mutex);
++  auto mapping = std::make_unique<Mapping>(); mapping->size = RoundUp(length, kUnit);
++  const auto handle = reinterpret_cast<FileMappingHandle>(mapping.get());
++  mappings.emplace(handle, std::move(mapping)); return handle;
++}
++
++void* MapFileView(FileMappingHandle handle, void* address, size_t length, PageAccess access,
++                  size_t offset) {
++  std::lock_guard lock(arena_mutex);
++  auto found = mappings.find(handle);
++  if (found == mappings.end() || !length || offset % kUnit || length % kUnit ||
++      offset > found->second->size || length > found->second->size - offset) return nullptr;
++  void* base = address;
++  int result = address ? ps5_vrange_reserve_at(address, length)
++                       : ps5_vrange_reserve(length, nullptr, kUnit, &base);
++  if (result) return nullptr;
++  View view{reinterpret_cast<uintptr_t>(base), length, offset,
++            std::vector<PageAccess>(length / kPage, access), {}};
++  for (const auto& [unit_offset, unit] : found->second->units) {
++    if (!MapUnit(view, unit_offset, unit)) {
++      for (size_t mapped : view.mapped)
++        ps5_shm_unmap(reinterpret_cast<void*>(view.base + mapped - view.offset), kUnit,
++                      PS5_SHM_KEEP_RESERVED);
++      ps5_vrange_release(base, length); return nullptr;
++    }
++  }
++  found->second->views.push_back(std::move(view)); return base;
++}
++
++bool UnmapFileView(FileMappingHandle handle, void* address, size_t length) {
++  std::lock_guard lock(arena_mutex);
++  auto found = mappings.find(handle); if (found == mappings.end()) return false;
++  auto& mapping = *found->second;
++  auto it = std::find_if(mapping.views.begin(), mapping.views.end(), [&](const View& view) {
++    return view.base == reinterpret_cast<uintptr_t>(address) && view.size == length;
++  });
++  if (it == mapping.views.end()) return false;
++  for (const auto& [offset, unit] : mapping.units) {
++    if (it->mapped.contains(offset))
++      if (ps5_shm_unmap(reinterpret_cast<void*>(it->base + offset - it->offset), kUnit,
++                        PS5_SHM_KEEP_RESERVED) != 0) return false;
++  }
++  if (ps5_vrange_release(address, length)) return false;
++  mapping.views.erase(it); return true;
++}
++void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path&) {
++  std::lock_guard lock(arena_mutex);
++  auto found = mappings.find(handle); if (found == mappings.end()) return;
++  while (!found->second->views.empty()) {
++    const auto view = found->second->views.back();
++    if (!UnmapFileView(handle, reinterpret_cast<void*>(view.base), view.size)) return;
++  }
++  for (auto& [offset, unit] : found->second->units) ps5_shm_destroy(&unit);
++  mappings.erase(found);
++}
++}  // namespace rex::memory
+diff --git a/src/core/platform/console_posix.cpp b/src/core/platform/console_posix.cpp
+index 669842b..19a6265 100644
+--- a/src/core/platform/console_posix.cpp
++++ b/src/core/platform/console_posix.cpp
+@@ -12,7 +12,8 @@
+ #include <rex/platform.h>
+ #include <rex/platform/console.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5,
++              "This file is POSIX-only");
+ 
+ #include <unistd.h>
+ 
+diff --git a/src/core/platform/env_posix.cpp b/src/core/platform/env_posix.cpp
+index fb794b2..e818a63 100644
+--- a/src/core/platform/env_posix.cpp
++++ b/src/core/platform/env_posix.cpp
+@@ -12,7 +12,8 @@
+ #include <rex/platform.h>
+ #include <rex/platform/env.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5,
++              "This file is POSIX-only");
+ 
+ #include <cstdlib>
+ #include <string>
+diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
+index 5e0a932..30e113b 100644
+--- a/src/core/seh_posix.cpp
++++ b/src/core/seh_posix.cpp
+@@ -9,7 +9,8 @@
+ #include <rex/platform.h>
+ #include <rex/platform/seh.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5,
++              "This file is POSIX-only");
+ 
+ #include <signal.h>
+ #include <cstdlib>  // std::abort()
+diff --git a/src/core/socket_posix.cpp b/src/core/socket_posix.cpp
+index b4b885a..84d4b01 100644
+--- a/src/core/socket_posix.cpp
++++ b/src/core/socket_posix.cpp
+@@ -1,7 +1,8 @@
+ #include <rex/net/socket.h>
+ #include <rex/platform.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5,
++              "This file is POSIX-only");
+ 
+ #include <sys/ioctl.h>
+ #include <unistd.h>
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 0e66b35..e2915a6 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ /**
+  * @file        core/threading_posix.cpp
+  * @brief       POSIX platform threading implementations
+@@ -9,7 +10,8 @@
+ #include <rex/platform.h>
+ #include <rex/thread.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5,
++              "This file is POSIX-only");
+ 
+ #include <signal.h>
+ 
+@@ -25,6 +27,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <pthread.h>
+ #include <semaphore.h>
+ 
++#if REX_PLATFORM_PS5
++#include <ps5platform/kernel.h>
++#endif
++
+ #if defined(__APPLE__)
+ #include <cstdio>
+ 
+@@ -176,7 +182,9 @@ void EnableAffinityConfiguration() {}
+ // uint64_t ticks() { return mach_absolute_time(); }
+ 
+ uint32_t current_thread_system_id() {
+-#if defined(__APPLE__)
++#if REX_PLATFORM_PS5
++  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_self()));
++#elif defined(__APPLE__)
+   return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+ #else
+   return static_cast<uint32_t>(syscall(SYS_gettid));
+@@ -744,7 +752,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     auto result = std::array<char, 17>{'\0'};
+     std::unique_lock<std::mutex> lock(state_mutex_);
+     if (state_ != State::kUninitialized && state_ != State::kFinished) {
+-#if REX_PLATFORM_ANDROID
++#if REX_PLATFORM_PS5
++      return ps5_name_;
++#elif REX_PLATFORM_ANDROID
+       // pthread_getname_np was added in API 26 - below that, store the name in
+       // this object, which may be only modified through Xenia threading, but
+       // should be enough in most cases.
+@@ -769,7 +779,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     WaitStarted();
+     std::unique_lock<std::mutex> lock(state_mutex_);
+     if (state_ != State::kUninitialized && state_ != State::kFinished) {
+-#if defined(__APPLE__)
++#if REX_PLATFORM_PS5
++      ps5_name_ = name.substr(0, 15);
++#elif defined(__APPLE__)
+       // macOS pthread_setname_np() only names the calling thread.
+       if (pthread_equal(thread_, pthread_self())) {
+         pthread_setname_np(std::string(name).c_str());
+@@ -794,7 +806,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
+   }
+ #endif
+ 
+-#if defined(__APPLE__)
++#if REX_PLATFORM_PS5
++  uint32_t system_id() const {
++    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(thread_));
++  }
++#elif defined(__APPLE__)
+   uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
+ #else
+   uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
+@@ -802,7 +818,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ 
+   uint64_t affinity_mask() {
+     WaitStarted();
+-#if defined(__APPLE__)
++#if REX_PLATFORM_PS5
++    uint64_t mask = 0;
++    if (scePthreadGetaffinity(thread_, &mask) != 0) {
++      assert_always();
++    }
++    return mask;
++#elif defined(__APPLE__)
+     // macOS doesn't expose Linux-style pthread affinity masks; report every
+     // logical processor as available.
+     auto cpu_count = std::min<uint32_t>(logical_processor_count(), 64);
+@@ -833,7 +855,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ 
+   void set_affinity_mask(uint64_t mask) {
+     WaitStarted();
+-#if defined(__APPLE__)
++#if REX_PLATFORM_PS5
++    if (scePthreadSetaffinity(thread_, mask) != 0) {
++      assert_always();
++    }
++#elif defined(__APPLE__)
+     // macOS doesn't expose Linux-style pthread affinity masks; keep this a
+     // no-op so higher layers can build and run.
+     (void)mask;
+@@ -906,7 +932,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       return;
+     }
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || REX_PLATFORM_PS5
+     // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
+     // without the sigval payload.
+     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
+@@ -959,6 +985,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     if (out_previous_suspend_count) {
+       *out_previous_suspend_count = suspend_count_;
+     }
++#if REX_PLATFORM_PS5
++    fprintf(stderr, "[Naruto thread] resume %p count %u\n", (void*)thread_, suspend_count_); fflush(stderr);
++#endif
+     --suspend_count_;
+     if (suspend_count_ == 0 && state_ == State::kSuspended) {
+       state_ = State::kRunning;
+@@ -1081,6 +1110,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+   mutable std::condition_variable state_signal_;
+   std::deque<std::function<void()>> user_callbacks_;
+   std::atomic<bool> has_pending_user_callbacks_{false};
++#if REX_PLATFORM_PS5
++  std::string ps5_name_;
++#endif
+ #if REX_PLATFORM_ANDROID
+   // Name accessible via name() on Android before API 26 which added
+   // pthread_getname_np.
+@@ -1475,6 +1507,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+                                        [thread] { return thread->handle_.suspend_count_ == 0; });
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto thread] entering routine %p\n", (void*)pthread_self()); fflush(stderr);
++#endif
+   start_routine();
+ 
+   {
+@@ -1547,7 +1582,11 @@ void Thread::Exit(int exit_code) {
+ }
+ 
+ void set_current_thread_name(const std::string_view name) {
+-#if defined(__APPLE__)
++#if REX_PLATFORM_PS5
++  if (current_thread_) {
++    current_thread_->condition().set_name(std::string(name));
++  }
++#elif defined(__APPLE__)
+   pthread_setname_np(std::string(name).c_str());
+ #else
+   pthread_setname_np(pthread_self(), std::string(name).c_str());
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index da7ae1a..f865d2c 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -96,7 +96,11 @@ if(REXGLUE_USE_D3D12)
+         ${REXGPU_XENOS_D3D12_SOURCES})
+ endif()
+ 
+-add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
++if(PS5)
++    add_library(rexgpu-xenos STATIC ${REXGPU_XENOS_SOURCES})
++else()
++    add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
++endif()
+ add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
+ 
+ set_target_properties(rexgpu-xenos PROPERTIES
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 7892600..997b72a 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -177,6 +178,18 @@ void CommandProcessor::ClearCaches() {}
+ 
+ void CommandProcessor::InvalidateGpuMemory() {}
+ 
++namespace {
++CommandProcessor::ResolveReadbackFilter resolve_readback_filter_ = nullptr;
++}  // namespace
++
++void CommandProcessor::SetResolveReadbackFilter(ResolveReadbackFilter filter) {
++  resolve_readback_filter_ = filter;
++}
++
++CommandProcessor::ResolveReadbackFilter CommandProcessor::resolve_readback_filter() {
++  return resolve_readback_filter_;
++}
++
+ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
+     bool legacy_readback_resolve_enabled) const {
+   ReadbackResolveMode shared_mode = ParseReadbackResolveMode(REXCVAR_GET(readback_resolve));
+@@ -205,6 +218,12 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
+   CallInThread([this, swap_post_effect]() { swap_post_effect_actual_ = swap_post_effect; });
+ }
+ 
++#if REX_PLATFORM_PS5 || defined(REX_GPU_STAGE_STATS_HOST)
++// Time the worker spends waiting for guest commands; read and reset by the
++// Vulkan backend's periodic PS5 timing log on the same thread.
++double g_ps5_command_stall_ms = 0;
++#endif
++
+ void CommandProcessor::WorkerThreadMain() {
+   if (!SetupContext()) {
+     rex::FatalError("Unable to setup command processor internal state");
+@@ -225,6 +244,9 @@ void CommandProcessor::WorkerThreadMain() {
+       // We spin here waiting for new ones, as the overhead of waiting on our
+       // event is too high.
+       PrepareForWait();
++#if REX_PLATFORM_PS5 || defined(REX_GPU_STAGE_STATS_HOST)
++      const auto stall_begin = std::chrono::steady_clock::now();
++#endif
+       uint32_t loop_count = 0;
+       do {
+         // If we spin around too much, revert to a "low-power" state.
+@@ -240,6 +262,11 @@ void CommandProcessor::WorkerThreadMain() {
+       } while (worker_running_ && pending_fns_.empty() &&
+                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
++#if REX_PLATFORM_PS5 || defined(REX_GPU_STAGE_STATS_HOST)
++      g_ps5_command_stall_ms +=
++          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stall_begin)
++              .count();
++#endif
+       if (!worker_running_ || !pending_fns_.empty()) {
+         continue;
+       }
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 953c5fd..58fbe72 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -28,6 +28,9 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ 
++REXCVAR_DEFINE_BOOL(render_target_update_memo, true, "GPU",
++                    "Skip repeated render target ownership updates for identical draws");
++
+ REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
+                     "Clamp MRT EDRAM used range to minimum");
+ 
+@@ -341,6 +344,7 @@ void RenderTargetCache::InitializeCommon() {
+ }
+ 
+ void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
++  ++ownership_epoch_;
+   ownership_ranges_.clear();
+   if (!shutting_down) {
+     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
+@@ -361,6 +365,7 @@ void RenderTargetCache::ShutdownCommon() {
+ }
+ 
+ void RenderTargetCache::ClearCache() {
++  ++ownership_epoch_;
+   // Keep only render targets currently owning any EDRAM data.
+   if (!render_targets_.empty()) {
+     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
+@@ -620,8 +625,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+                      << (((rts_are_64bpp >> rt_base_last.second) & 1) ^ 1));
+   }
+ 
+-  // Make sure all the needed render targets are created, and gather lengths of
+-  // ranges used by each render target.
++  // Gather the keys of the needed render targets and lengths of ranges used by
++  // each render target.
+   RenderTargetKey rt_keys[1 + xenos::kMaxColorRenderTargets];
+   RenderTarget* rts[1 + xenos::kMaxColorRenderTargets];
+   uint32_t rt_lengths_tiles[1 + xenos::kMaxColorRenderTargets];
+@@ -639,13 +644,6 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+     rt_key.msaa_samples = msaa_samples;
+     rt_key.is_depth = rt_bit_index == 0;
+     rt_key.resource_format = resource_formats[rt_bit_index];
+-    if (!interlock_barrier_only) {
+-      RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
+-      if (!render_target) {
+-        return false;
+-      }
+-      rts[rt_bit_index] = render_target;
+-    }
+     uint32_t rt_is_64bpp = (rts_are_64bpp >> rt_bit_index) & 1;
+     // The last render target can occupy the EDRAM until the base of the first
+     // render target (itself in case of 1 render target) with EDRAM addressing
+@@ -658,36 +656,76 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+                                        rt_base);
+   }
+ 
+-  if (interlock_barrier_only) {
+-    // Because a full pixel shader interlock barrier may clear the ownership map
+-    // (since it flushes all previous writes, and there's no need for another
+-    // barrier if an overlap is encountered later between pre-barrier and
+-    // post-barrier usages), check if any overlap requiring a barrier happens,
+-    // and then insert the barrier if needed.
+-    bool interlock_barrier_needed = false;
++  // The ranges of one draw don't overlap, so repeating the previous update's
++  // ownership changes with nothing modified in between transfers nothing and
++  // binds the same render targets.
++  bool update_repeated = REXCVAR_GET(render_target_update_memo) && !interlock_barrier_only &&
++                         update_memo_epoch_ == ownership_epoch_ &&
++                         update_memo_count_ == edram_bases_sorted_count;
++  for (uint32_t i = 0; update_repeated && i < edram_bases_sorted_count; ++i) {
++    const UpdateMemo& memo = update_memo_[i];
++    uint32_t rt_bit_index = edram_bases_sorted[i].second;
++    update_repeated = memo.rt_bit_index == rt_bit_index && memo.key == rt_keys[rt_bit_index] &&
++                      memo.length_tiles == rt_lengths_tiles[i];
++  }
++  if (update_repeated) {
+     for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+-      const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+-      if (WouldOwnershipChangeRequireTransfers(rt_keys[rt_base_index.second], 0,
+-                                               rt_lengths_tiles[i])) {
+-        interlock_barrier_needed = true;
+-        break;
++      rts[update_memo_[i].rt_bit_index] = update_memo_[i].render_target;
++    }
++  } else {
++    update_memo_epoch_ = UINT64_MAX;
++    if (!interlock_barrier_only) {
++      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
++        uint32_t rt_bit_index = edram_bases_sorted[i].second;
++        RenderTarget* render_target = GetOrCreateRenderTarget(rt_keys[rt_bit_index]);
++        if (!render_target) {
++          return false;
++        }
++        rts[rt_bit_index] = render_target;
+       }
+     }
+-    if (interlock_barrier_needed) {
+-      RequestPixelShaderInterlockBarrier();
++
++    if (interlock_barrier_only) {
++      // Because a full pixel shader interlock barrier may clear the ownership
++      // map (since it flushes all previous writes, and there's no need for
++      // another barrier if an overlap is encountered later between pre-barrier
++      // and post-barrier usages), check if any overlap requiring a barrier
++      // happens, and then insert the barrier if needed.
++      bool interlock_barrier_needed = false;
++      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
++        const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
++        if (WouldOwnershipChangeRequireTransfers(rt_keys[rt_base_index.second], 0,
++                                                 rt_lengths_tiles[i])) {
++          interlock_barrier_needed = true;
++          break;
++        }
++      }
++      if (interlock_barrier_needed) {
++        RequestPixelShaderInterlockBarrier();
++      }
+     }
+-  }
+ 
+-  // From now on ownership transfers should succeed for simplicity and
+-  // consistency, even if they fail in the implementation (just ignore that and
+-  // draw with whatever contents currently are in the render target in this
+-  // case).
++    // From now on ownership transfers should succeed for simplicity and
++    // consistency, even if they fail in the implementation (just ignore that
++    // and draw with whatever contents currently are in the render target in
++    // this case).
+ 
+-  for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+-    const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+-    uint32_t rt_bit_index = rt_base_index.second;
+-    ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+-                    interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
++    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
++      const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
++      uint32_t rt_bit_index = rt_base_index.second;
++      ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
++                      interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
++    }
++
++    if (!interlock_barrier_only) {
++      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
++        uint32_t rt_bit_index = edram_bases_sorted[i].second;
++        update_memo_[i] = {rt_bit_index, rt_keys[rt_bit_index], rt_lengths_tiles[i],
++                           rts[rt_bit_index]};
++      }
++      update_memo_count_ = edram_bases_sorted_count;
++      update_memo_epoch_ = ownership_epoch_;
++    }
+   }
+ 
+   if (interlock_barrier_only) {
+@@ -1125,6 +1163,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
+ }
+ 
+ void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
++  ++ownership_epoch_;
+   assert_true(GetPath() == Path::kPixelShaderInterlock);
+   // Clear ownership - any overlap of data written before the barrier is safe.
+   OwnershipRange empty_range(xenos::kEdramTileCount, RenderTargetKey(), RenderTargetKey(),
+@@ -1245,6 +1284,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+   // are clamped to xenos::kEdramTileCount.
+   assert_true(start_tiles_base_relative <= (xenos::kEdramTileCount - uint32_t(length_tiles != 0)));
+   assert_true(length_tiles <= xenos::kEdramTileCount);
++  ++ownership_epoch_;
+   if (length_tiles == 0) {
+     return;
+   }
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index ebae7db..9b8fff0 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -127,6 +127,14 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
+ 
+ namespace rex::graphics {
+ 
++namespace {
++TextureCache::GuestTextureLoadHook guest_texture_load_hook = nullptr;
++}  // namespace
++
++void TextureCache::SetGuestTextureLoadHook(GuestTextureLoadHook hook) {
++  guest_texture_load_hook = hook;
++}
++
+ const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
+     // k8bpb
+     {3, 4, 1, 4},
+@@ -401,6 +409,26 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
+     pending_range.length =
+         static_cast<uint32_t>(rex::align(texture.GetGuestBaseSize(), UINT32_C(16)));
+     pending_ranges_out[pending_range_count_out++] = pending_range;
++    // Before the range is requested, so a substitution is what gets uploaded.
++    if (guest_texture_load_hook && !texture_key.scaled_resolve) {
++      const texture_util::TextureGuestLayout& layout = texture.guest_layout();
++      GuestTextureLoad load;
++      load.base_address = pending_range.start;
++      load.format = texture_key.format;
++      load.dimension = texture_key.dimension;
++      load.endianness = texture_key.endianness;
++      load.width = texture_key.GetWidth();
++      load.height = texture_key.GetHeight();
++      load.tiled = texture_key.tiled != 0;
++      load.base_packed = layout.packed_level == 0;
++      load.row_pitch_bytes = layout.base.row_pitch_bytes;
++      load.base_size_bytes = texture.GetGuestBaseSize();
++      load.guest_data = shared_memory().memory().TranslatePhysical(pending_range.start);
++      if (guest_texture_load_hook(load)) {
++        // Host writes bypass write watches; drop any uploaded copy.
++        shared_memory().MemoryInvalidationCallback(load.base_address, load.base_size_bytes, true);
++      }
++    }
+   }
+   if (mips_outdated) {
+     PendingSharedMemoryRange pending_range;
+@@ -457,11 +485,34 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
+ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+   const auto& regs = register_file();
+ 
+-  if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+-    // A texture has become outdated - make sure whether textures are outdated
+-    // is rechecked in this draw and in subsequent ones to reload the new data
+-    // if needed.
+-    ResetTextureBindings();
++  if (texture_became_outdated_.load(std::memory_order_acquire) &&
++      texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
++    ++binding_invalidation_stats_[0];
++    uint32_t bindings_reset = 0;
++    for (uint32_t i = 0; i < texture_bindings_.size(); ++i) {
++      TextureBinding& binding = texture_bindings_[i];
++      if (!binding.key.is_valid) continue;
++      // Watch callbacks publish per-texture atomic dirty bits before the global
++      // notification. A racing later write leaves another notification for the
++      // next draw; unchanged bindings do not need their keys or views rebuilt.
++      const bool outdated = (binding.texture && binding.texture->outdated_mask()) ||
++          (binding.texture_signed && binding.texture_signed->outdated_mask());
++      if (!outdated) {
++        ++binding_invalidation_stats_[2];
++        continue;
++      }
++      binding.Reset();
++      bindings_reset |= UINT32_C(1) << i;
++      ++binding_invalidation_stats_[1];
++    }
++    texture_bindings_in_sync_ &= ~bindings_reset;
++    if (bindings_reset) UpdateTextureBindingsImpl(bindings_reset);
++  }
++
++  // Memory invalidation above may reset these bits. Only skip preparation after
++  // that check, so guest writes still reload textures with unchanged fetch data.
++  if (!(used_texture_mask & ~texture_bindings_in_sync_)) {
++    return;
+   }
+ 
+   // Update the texture keys and the textures.
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 25fca71..7a2c4d3 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -11,15 +11,27 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <string>
+ #include <utility>
+ 
++#include <fmt/format.h>
++#include <xxhash.h>
++
+ #include <rex/assert.h>
+ #include <rex/bit.h>
+ #include <rex/dbg.h>
++#include <rex/cvar.h>
+ #include <rex/graphics/shared_memory.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+ 
++REXCVAR_DEFINE_BOOL(shared_memory_verify_valid_pages, false, "GPU",
++                    "Debug: report valid shared memory pages changed without an invalidation");
++
++REXCVAR_DEFINE_BOOL(shared_memory_request_cache, true, "GPU",
++                    "Skip page checks for repeated shared memory requests with no invalidation");
++
+ namespace rex::graphics {
+ 
+ SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
+@@ -33,6 +45,7 @@ SharedMemory::~SharedMemory() {
+ void SharedMemory::InitializeCommon() {
+   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
+   system_page_flags_valid_.assign(num_system_page_flags_, 0);
++  validity_epoch_.fetch_add(1, std::memory_order_release);
+   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+ 
+   memory_invalidation_callback_handle_ =
+@@ -91,6 +104,8 @@ void SharedMemory::ShutdownCommon() {
+ 
+ void SharedMemory::InvalidateAllPages() {
+   auto global_lock = global_critical_region_.Acquire();
++  validity_epoch_.fetch_add(1, std::memory_order_release);
++  verified_page_hashes_.clear();
+ 
+   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
+   std::fill(system_page_flags_valid_and_gpu_written_.begin(),
+@@ -99,6 +114,12 @@ void SharedMemory::InvalidateAllPages() {
+ 
+ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
+   auto global_lock = global_critical_region_.Acquire();
++  if (REXCVAR_GET(shared_memory_verify_valid_pages)) {
++    VerifyValidPages();
++  }
++  // Only CPU-uploaded pages have hashes, and they all lose validity here.
++  verified_page_hashes_.clear();
++  validity_epoch_.fetch_add(1, std::memory_order_release);
+ 
+   // Pages that are valid only because the CPU uploaded them lose their valid
+   // bit here, so the next frame re-reads them from guest memory.
+@@ -306,6 +327,17 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
+       uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
+       gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
+     }
++    if (REXCVAR_GET(shared_memory_verify_valid_pages)) {
++      const uint32_t page_size = uint32_t(1) << page_size_log2_;
++      for (uint32_t page = valid_page_first; page <= valid_page_last; ++page) {
++        if (written_by_gpu) {
++          verified_page_hashes_.erase(page);
++        } else {
++          verified_page_hashes_[page] =
++              XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_), page_size);
++        }
++      }
++    }
+   }
+ 
+   if (memory_invalidation_callback_handle_) {
+@@ -342,8 +374,24 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     return true;
+   }
+ 
++  // Repeated single-range requests (index and vertex buffers shared by many
++  // draws) are still satisfied if no page has lost validity since. Read the
++  // epoch before checking the pages so a concurrent invalidation is never
++  // recorded as covered.
++  const uint64_t validity_epoch = validity_epoch_.load(std::memory_order_acquire);
++  RequestCacheEntry* request_cache_entry = nullptr;
++  if (count == 1 && REXCVAR_GET(shared_memory_request_cache)) {
++    const uint32_t hash = ((ranges[0].first >> 4) ^ ranges[0].second) * UINT32_C(2654435761);
++    request_cache_entry = &request_cache_[hash >> 24];
++    if (request_cache_entry->epoch == validity_epoch &&
++        request_cache_entry->start == ranges[0].first &&
++        request_cache_entry->length == ranges[0].second) {
++      return true;
++    }
++  }
++
+   // Some texture or buffer is empty, for example - safe to draw in this case.
+-  std::vector<std::pair<uint32_t, uint32_t>>& merged_ranges = request_ranges_merged_;
++  std::vector<std::pair<uint32_t, uint32_t>>& merged_ranges = merged_request_ranges_;
+   merged_ranges.clear();
+   for (size_t i = 0; i < count; ++i) {
+     uint32_t start = ranges[i].first;
+@@ -496,11 +544,44 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
+                     uint32_t(upload_ranges_.size()));
+ 
+-  if (upload_ranges_.empty()) {
+-    return true;
++  if (!upload_ranges_.empty() && !UploadRanges(upload_ranges_)) {
++    return false;
++  }
++  if (request_cache_entry) {
++    *request_cache_entry = {ranges[0].first, ranges[0].second, validity_epoch};
+   }
++  return true;
++}
+ 
+-  return UploadRanges(upload_ranges_);
++void SharedMemory::VerifyValidPages() {
++  auto global_lock = global_critical_region_.Acquire();
++  const uint32_t page_size = uint32_t(1) << page_size_log2_;
++  uint32_t checked = 0, mismatched = 0;
++  std::string examples;
++  for (auto& [page, hash] : verified_page_hashes_) {
++    const uint64_t bit = uint64_t(1) << (page & 63);
++    if (!(system_page_flags_valid_[page >> 6] & bit) ||
++        (system_page_flags_valid_and_gpu_written_[page >> 6] & bit)) {
++      continue;
++    }
++    ++checked;
++    const uint64_t current =
++        XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_), page_size);
++    if (current != hash) {
++      if (mismatched < 8) {
++        examples += fmt::format(" {:08X}", page << page_size_log2_);
++      }
++      ++mismatched;
++      hash = current;
++    }
++  }
++  verify_mismatched_pages_total_ += mismatched;
++  if (mismatched) {
++    REXGPU_WARN(
++        "Shared memory verify: {} of {} valid CPU-uploaded pages changed without invalidation "
++        "(total {}); physical:{}",
++        mismatched, checked, verify_mismatched_pages_total_, examples);
++  }
+ }
+ 
+ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+@@ -556,6 +637,7 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+   uint32_t block_last = page_last >> 6;
+ 
+   auto global_lock = global_critical_region_.Acquire();
++  validity_epoch_.fetch_add(1, std::memory_order_release);
+ 
+   if (!exact_range) {
+     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
+@@ -591,6 +673,12 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
+   }
+ 
++  if (!verified_page_hashes_.empty()) {
++    for (uint32_t page = page_first; page <= page_last; ++page) {
++      verified_page_hashes_.erase(page);
++    }
++  }
++
+   FireWatches(page_first, page_last, false);
+ 
+   return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 24abe85..55bfc65 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -10,6 +11,8 @@
+  */
+ 
+ #include <algorithm>
++#include <bit>
++#include <chrono>
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
+@@ -82,10 +85,55 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "device (falls back to render passes otherwise)")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// PS5 builds always collect the periodic GPU-thread stage timings; host
++// profiling builds opt in with REX_GPU_STAGE_STATS_HOST.
++#if REX_PLATFORM_PS5 || defined(REX_GPU_STAGE_STATS_HOST)
++#define REX_GPU_STAGE_STATS 1
++#else
++#define REX_GPU_STAGE_STATS 0
++#endif
++
++#if REX_GPU_STAGE_STATS
++namespace rex::graphics {
++extern double g_ps5_command_stall_ms;
++}
++#endif
++
++REXCVAR_DECLARE(bool, shared_memory_verify_valid_pages);
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+ 
++#if REX_GPU_STAGE_STATS
++struct CpuStageTotals { uint64_t calls = 0; double milliseconds = 0; };
++// 0 draw, 1 end submission, 2 fence, 3 textures, 4 targets, 5 pipelines,
++// 6 bindings, 7/9 reuse counters, 8 queue submits, 10 primitives,
++// 11 vertex buffers, 12 viewport and dynamic state, 13 system constants.
++static CpuStageTotals cpu_stage_totals[14];
++struct ScopedCpuStage {
++  unsigned stage;
++  bool sampled;
++  std::chrono::steady_clock::time_point begin;
++  explicit ScopedCpuStage(unsigned value) : stage(value) {
++    auto& total = cpu_stage_totals[stage];
++    ++total.calls;
++    sampled = (stage == 1 || stage == 2 || (total.calls & 63) == 0);
++    if (sampled) begin = std::chrono::steady_clock::now();
++  }
++  ~ScopedCpuStage() {
++    if (!sampled) return;
++    cpu_stage_totals[stage].milliseconds += std::chrono::duration<double, std::milli>(
++        std::chrono::steady_clock::now() - begin).count() * ((stage == 1 || stage == 2) ? 1 : 64);
++  }
++};
++template <typename F> auto ProfileDrawStage(unsigned stage, F&& f) {
++  ScopedCpuStage sample(stage);
++  return f();
++}
++
++#endif
++
+ // glslang default built-in resource limits.
+ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
+     /* .maxLights = */ 32,
+@@ -510,9 +558,15 @@ void main() {
+ 
+ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
+                                 std::vector<uint32_t>& spirv_out, std::string& error_out) {
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] GLSL initialize\n"); fflush(stderr);
++#endif
+   static std::once_flag glslang_initialize_once;
+   std::call_once(glslang_initialize_once, []() { glslang::InitializeProcess(); });
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] GLSL initialized\n"); fflush(stderr);
++#endif
+   const char* source_c_str = source.data();
+   glslang::TShader shader(stage);
+   shader.setStrings(&source_c_str, 1);
+@@ -520,6 +574,9 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
+   shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
+   shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] GLSL parse\n"); fflush(stderr);
++#endif
+   EShMessages messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
+   if (!shader.parse(&kGlslangDefaultTBuiltInResource, 450, false, messages)) {
+     error_out = "glslang shader parse failed";
+@@ -531,6 +588,9 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
+     return false;
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] GLSL link\n"); fflush(stderr);
++#endif
+   glslang::TProgram program;
+   program.addShader(&shader);
+   if (!program.link(messages)) {
+@@ -549,6 +609,9 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
+     return false;
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] GLSL SPIRV\n"); fflush(stderr);
++#endif
+   glslang::SpvOptions spv_options = {};
+   spv_options.disableOptimizer = true;
+   spv_options.optimizeSize = false;
+@@ -580,6 +643,10 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuf
+     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+     SpirvShaderTranslator::kConstantBufferCount* kLinkedTypeDescriptorPoolSetCount};
+ 
++const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeDynamicUniformBuffer = {
++    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
++    SpirvShaderTranslator::kConstantBufferCount * kLinkedTypeDescriptorPoolSetCount};
++
+ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
+     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kLinkedTypeDescriptorPoolSetCount};
+ 
+@@ -597,6 +664,10 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
+           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+               ->vulkan_device(),
+           &kDescriptorPoolSizeUniformBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
++      transient_descriptor_allocator_dynamic_uniform_buffer_(
++          static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
++              ->vulkan_device(),
++          &kDescriptorPoolSizeDynamicUniformBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
+       transient_descriptor_allocator_storage_buffer_(
+           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+               ->vulkan_device(),
+@@ -931,7 +1002,7 @@ bool VulkanCommandProcessor::SetupContext() {
+   for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+     VkDescriptorSetLayoutBinding& constants_binding = descriptor_set_layout_bindings_constants[i];
+     constants_binding.binding = i;
+-    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+     constants_binding.descriptorCount = 1;
+     constants_binding.pImmutableSamplers = nullptr;
+   }
+@@ -1133,6 +1204,9 @@ bool VulkanCommandProcessor::SetupContext() {
+     return false;
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] texture cache ready\n"); fflush(stderr);
++#endif
+   // Shared memory and EDRAM common bindings.
+   VkDescriptorPoolSize descriptor_pool_sizes[1];
+   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+@@ -1208,6 +1282,9 @@ bool VulkanCommandProcessor::SetupContext() {
+   dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock),
+                              write_descriptor_sets, 0, nullptr);
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] swap objects\n"); fflush(stderr);
++#endif
+   // Swap objects.
+ 
+   // Gamma ramp, either device-local and host-visible at once, or separate
+@@ -1665,6 +1742,9 @@ bool VulkanCommandProcessor::SetupContext() {
+     return false;
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] gamma graphics pipelines\n"); fflush(stderr);
++#endif
+   // Gamma ramp application pipeline.
+   // Using a graphics pipeline, not a compute one, because storage image support
+   // is optional for VK_FORMAT_A2B10G10R10_UNORM_PACK32.
+@@ -1877,6 +1957,9 @@ bool VulkanCommandProcessor::SetupContext() {
+     return false;
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] gamma compute pipelines\n"); fflush(stderr);
++#endif
+   // Gamma ramp application compute pipelines.
+   swap_apply_gamma_compute_256_entry_table_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+       vulkan_device, swap_apply_gamma_compute_pipeline_layout_, shaders::apply_gamma_table_cs,
+@@ -1940,6 +2023,9 @@ bool VulkanCommandProcessor::SetupContext() {
+                                     "swap gamma PWL FXAA-luma compute red/blue fallback");
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] FXAA pipelines\n"); fflush(stderr);
++#endif
+   // FXAA compute pipelines, compiled to SPIR-V at runtime.
+   std::vector<uint32_t> swap_fxaa_spirv;
+   std::string swap_fxaa_compile_error;
+@@ -1999,6 +2085,9 @@ bool VulkanCommandProcessor::SetupContext() {
+ 
+   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] GPU setup complete\n"); fflush(stderr);
++#endif
+   // Just not to expose uninitialized memory.
+   std::memset(&system_constants_, 0, sizeof(system_constants_));
+ 
+@@ -2397,6 +2486,21 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
+   if (!num_registers) {
+     return;
+   }
++  // Split ranges that cross register regions so each region takes its bulk path
++  // (type-0 packets routinely span general registers and constants).
++  const uint32_t region_end =
++      start_index < XE_GPU_REG_SHADER_CONSTANT_000_X        ? XE_GPU_REG_SHADER_CONSTANT_000_X
++      : start_index <= XE_GPU_REG_SHADER_CONSTANT_511_W     ? XE_GPU_REG_SHADER_CONSTANT_511_W + 1
++      : start_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 ? XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 + 1
++      : start_index < XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 ? XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031
++      : start_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31   ? XE_GPU_REG_SHADER_CONSTANT_LOOP_31 + 1
++                                                            : UINT32_MAX;
++  if (num_registers > region_end - start_index) {
++    const uint32_t first_count = region_end - start_index;
++    WriteRegistersFromMem(start_index, base, first_count);
++    WriteRegistersFromMem(region_end, base + first_count, num_registers - first_count);
++    return;
++  }
+   uint32_t end_index = start_index + num_registers - 1;
+ 
+   auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,
+@@ -2490,7 +2594,6 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
+     if (texture_cache_) {
+       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+     }
+-    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
+     return;
+   }
+ 
+@@ -2582,6 +2685,42 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+                                             frame_used_async_placeholder_pipeline_;
++#if REX_GPU_STAGE_STATS
++  // GPU-thread-only counters: swap requests are not display refresh counts.
++  using PerfClock = std::chrono::steady_clock;
++  const auto perf_now = PerfClock::now();
++  static auto perf_start = perf_now, perf_last = perf_now;
++  static uint32_t perf_swaps = 0, perf_skips = 0, perf_over50 = 0;
++  static double perf_max_ms = 0;
++  const double gap_ms = std::chrono::duration<double, std::milli>(perf_now - perf_last).count();
++  perf_last = perf_now;
++  ++perf_swaps;
++  perf_skips += skip_present_due_async_placeholder;
++  perf_over50 += gap_ms > 50;
++  perf_max_ms = std::max(perf_max_ms, gap_ms);
++  const double elapsed = std::chrono::duration<double>(perf_now - perf_start).count();
++  if (elapsed >= 5) {
++    REXGPU_INFO("PS5 frame timing: seconds={:.2f} swap_requests={} shader_skips={} gaps_over50ms={} max_gap_ms={:.1f}",
++                elapsed, perf_swaps, perf_skips, perf_over50, perf_max_ms);
++    REXGPU_INFO("PS5 CPU stages (overlapping): draws={} draw_ms={:.1f} end_submission_calls={} submit_ms={:.1f} fence_checks={} fence_ms={:.1f} queue_submits={}",
++        cpu_stage_totals[0].calls, cpu_stage_totals[0].milliseconds,
++        cpu_stage_totals[1].calls, cpu_stage_totals[1].milliseconds,
++        cpu_stage_totals[2].calls, cpu_stage_totals[2].milliseconds, cpu_stage_totals[8].calls);
++    REXGPU_INFO("PS5 sampled draw stages: textures_ms={:.1f} targets_ms={:.1f} pipelines_ms={:.1f} bindings_ms={:.1f} descriptor_reuses={} avoided_constant_updates={}",
++        cpu_stage_totals[3].milliseconds, cpu_stage_totals[4].milliseconds,
++        cpu_stage_totals[5].milliseconds, cpu_stage_totals[6].milliseconds, cpu_stage_totals[7].calls, cpu_stage_totals[9].calls);
++    const auto texture_invalidations = texture_cache_->TakeBindingInvalidationStats();
++    REXGPU_INFO("PS5 sampled draw stages 2: primitives_ms={:.1f} vertex_buffers_ms={:.1f} viewport_ms={:.1f} system_constants_ms={:.1f} command_stall_ms={:.1f}",
++        cpu_stage_totals[10].milliseconds, cpu_stage_totals[11].milliseconds,
++        cpu_stage_totals[12].milliseconds, cpu_stage_totals[13].milliseconds,
++        g_ps5_command_stall_ms);
++    g_ps5_command_stall_ms = 0;
++    REXGPU_INFO("PS5 texture invalidations: notifications={} bindings_reset={} bindings_kept={}",
++        texture_invalidations[0], texture_invalidations[1], texture_invalidations[2]);
++    for (auto& total : cpu_stage_totals) total = {};
++    perf_start = perf_now; perf_swaps = perf_skips = perf_over50 = 0; perf_max_ms = 0;
++  }
++#endif
+   if (skip_present_due_async_placeholder) {
+     static bool skipped_incomplete_frame_logged = false;
+     if (!skipped_incomplete_frame_logged) {
+@@ -3950,6 +4089,9 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                        IndexBufferInfo* index_buffer_info,
+                                        bool major_mode_explicit) {
++#if REX_GPU_STAGE_STATS
++  ScopedCpuStage cpu_stage(0);
++#endif
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -4068,7 +4210,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+ 
+     // Process primitives.
+-    if (!primitive_processor_->Process(primitive_processing_result)) {
++#if REX_GPU_STAGE_STATS
++    const bool primitives_ready =
++        ProfileDrawStage(10, [&] { return primitive_processor_->Process(primitive_processing_result); });
++#else
++    const bool primitives_ready = primitive_processor_->Process(primitive_processing_result);
++#endif
++    if (!primitives_ready) {
+       return draw_fail("primitive_processing");
+     }
+     if (!primitive_processing_result.host_draw_vertex_count) {
+@@ -4195,12 +4343,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
++#if REX_GPU_STAGE_STATS
++  ProfileDrawStage(3, [&] { texture_cache_->RequestTextures(used_texture_mask); });
++#else
+   texture_cache_->RequestTextures(used_texture_mask);
++#endif
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+   // Set up the render targets - this may perform dispatches and draws.
+-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+-                                    normalized_color_mask, *vertex_shader)) {
++#if REX_GPU_STAGE_STATS
++  const bool targets_ready = ProfileDrawStage(4, [&] { return render_target_cache_->Update(
++      is_rasterization_done, normalized_depth_control, normalized_color_mask, *vertex_shader); });
++#else
++  const bool targets_ready = render_target_cache_->Update(is_rasterization_done,
++      normalized_depth_control, normalized_color_mask, *vertex_shader);
++#endif
++  if (!targets_ready) {
+     return draw_fail("render_target_update");
+   }
+ 
+@@ -4209,11 +4367,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // textures.
+   VkPipeline pipeline;
+   void* pipeline_handle = nullptr;
+-  if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
+-                                          primitive_processing_result, normalized_depth_control,
+-                                          normalized_color_mask,
+-                                          render_target_cache_->last_update_render_pass_key(),
+-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
++  auto configure_pipeline = [&] { return pipeline_cache_->ConfigurePipeline(
++      vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
++      normalized_depth_control, normalized_color_mask, render_target_cache_->last_update_render_pass_key(),
++      pipeline, pipeline_layout_provider, &pipeline_handle); };
++#if REX_GPU_STAGE_STATS
++  const bool pipeline_ready = ProfileDrawStage(5, configure_pipeline);
++#else
++  const bool pipeline_ready = configure_pipeline();
++#endif
++  if (!pipeline_ready) {
+     return draw_fail("configure_pipeline");
+   }
+   bool pipeline_is_placeholder = false;
+@@ -4254,6 +4417,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         descriptor_sets_kept = std::min(
+             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+       }
++      current_graphics_descriptor_sets_bound_up_to_date_ &=
++          (UINT32_C(1) << descriptor_sets_kept) - 1;
+     } else {
+       // No or unknown pipeline layout previously bound - all bindings are in an
+       // indeterminate state.
+@@ -4285,6 +4450,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // life. Or even disregard the viewport bounds range in the fragment shader
+   // interlocks case completely - apply the viewport and the scissor offset
+   // directly to pixel address and to things like ps_param_gen.
++  {
++#if REX_GPU_STAGE_STATS
++  ScopedCpuStage viewport_stage(12);
++#endif
+   draw_util::GetHostViewportInfo(
+       regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
+       device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
+@@ -4294,6 +4463,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   // Update dynamic graphics pipeline state.
+   UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
++  }
+ 
+   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+ 
+@@ -4327,17 +4497,31 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   }
+ 
+   // Update system constants before uploading them.
+-  UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
+-                             shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
+-                             normalized_depth_control, normalized_color_mask);
++  {
++#if REX_GPU_STAGE_STATS
++    ScopedCpuStage system_constants_stage(13);
++#endif
++    UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
++                               shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
++                               normalized_depth_control, normalized_color_mask);
++  }
+ 
+   // Update uniform buffers and descriptor sets after binding the pipeline with
+   // the new layout.
+-  if (!UpdateBindings(vertex_shader, pixel_shader)) {
++#if REX_GPU_STAGE_STATS
++  const bool bindings_ready = ProfileDrawStage(6, [&] { return UpdateBindings(vertex_shader, pixel_shader); });
++#else
++  const bool bindings_ready = UpdateBindings(vertex_shader, pixel_shader);
++#endif
++  if (!bindings_ready) {
+     return draw_fail("update_bindings");
+   }
+ 
+   // Ensure vertex buffers are resident.
++  {
++#if REX_GPU_STAGE_STATS
++  ScopedCpuStage vertex_buffers_stage(11);
++#endif
+   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+@@ -4386,6 +4570,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+     }
+   }
++  }
+ 
+   // Synchronize the memory pages backing memory scatter export streams, and
+   // calculate the range that includes the streams for the buffer barrier.
+@@ -4555,8 +4740,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
+   }
+ 
+-  if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
+-      !memexport_ranges_.empty()) {
++  // Check the ranges first: the enable check looks a cvar up by name.
++  if (!memexport_ranges_.empty() &&
++      IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
+     uint32_t memexport_total_size = 0;
+     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+       memexport_total_size += memexport_range.size_bytes;
+@@ -4780,7 +4966,7 @@ bool VulkanCommandProcessor::IssueCopy() {
+   }
+ 
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+-  if (readback_mode == ReadbackResolveMode::kDisabled) {
++  if (readback_mode == ReadbackResolveMode::kDisabled && !resolve_readback_filter()) {
+     uint32_t written_address, written_length;
+     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                          written_address, written_length);
+@@ -4810,7 +4996,23 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+ 
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+-    return true;
++    // Only resolves the title filter asks for, read back synchronously.
++    ResolveReadbackFilter filter = resolve_readback_filter();
++    if (!filter) {
++      return true;
++    }
++    const auto dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
++    const auto dest_pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>();
++    ResolveReadbackRequest request;
++    request.address = written_address;
++    request.length = written_length;
++    request.format = dest_info.copy_dest_format;
++    request.pitch = dest_pitch.copy_dest_pitch;
++    request.height = dest_pitch.copy_dest_height;
++    if (!filter(request)) {
++      return true;
++    }
++    readback_mode = ReadbackResolveMode::kFull;
+   }
+ 
+   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
+@@ -5334,6 +5536,9 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
+ }
+ 
+ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
++#if REX_GPU_STAGE_STATS
++  ScopedCpuStage cpu_stage(2);
++#endif
+   // Only report once, no need to retry a wait that won't succeed anyway.
+   if (device_lost_) {
+     return;
+@@ -5376,13 +5581,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+   }
+   if (await_submission > submission_completed_) {
+     // Await in a blocking way if requested.
+-    // TODO(Triang3l): Await only one fence. "Fence signal operations that are
+-    // defined by vkQueueSubmit additionally include in the first
+-    // synchronization scope all commands that occur earlier in submission
+-    // order."
++    // Fence signaling includes earlier commands in submission order.
++    // Submissions use one ordered graphics queue. The final requested fence
++    // covers all preceding work; waiting on every fence adds driver overhead.
++    const size_t last_awaited = size_t(await_submission - submission_completed_ - 1);
+     VkResult wait_result =
+-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
++        dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[last_awaited],
++                            VK_TRUE, UINT64_MAX);
+     if (wait_result == VK_SUCCESS) {
+       fences_awaited += await_submission - submission_completed_;
+     } else {
+@@ -5397,7 +5602,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+   // that for simplicity.
+   while (fences_awaited < fences_total) {
+     VkResult fence_status =
+-        dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited], VK_TRUE, 0);
++        dfn.vkGetFenceStatus(device, submissions_in_flight_fences_[fences_awaited]);
+     if (fence_status != VK_SUCCESS) {
+       if (fence_status == VK_ERROR_DEVICE_LOST) {
+         device_lost_ = true;
+@@ -5641,6 +5846,12 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+ }
+ 
+ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
++  // Never reuse descriptors across submission/resource-reclamation boundaries.
++  for (auto& snapshot : texture_descriptor_snapshots_) snapshot.Invalidate();
++  constant_descriptor_snapshot_.Invalidate();
++#if REX_GPU_STAGE_STATS
++  ScopedCpuStage cpu_stage(1);
++#endif
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -5885,6 +6096,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+   if (is_closing_frame) {
+     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
+       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
++    } else if (REXCVAR_GET(shared_memory_verify_valid_pages) && shared_memory_) {
++      shared_memory_->VerifyValidPages();
+     }
+     frame_open_ = false;
+     // Submission already closed now, so minus 1.
+@@ -5926,6 +6139,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+   return true;
+ }
+ 
++
+ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
+   texture_transient_descriptor_sets_free_.clear();
+   texture_transient_descriptor_sets_used_.clear();
+@@ -5940,6 +6154,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
+   single_transient_descriptors_used_.clear();
+   transient_descriptor_allocator_storage_buffer_.Reset();
+   transient_descriptor_allocator_uniform_buffer_.Reset();
++  transient_descriptor_allocator_dynamic_uniform_buffer_.Reset();
+ }
+ 
+ void VulkanCommandProcessor::SplitPendingBarrier() {
+@@ -6797,6 +7012,23 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+   }
+ }
+ 
++// Packs the float constants marked in a 256-bit usage map into the upload,
++// copying each run of consecutive used constants with a single memcpy.
++static void CopyUsedFloatConstants(uint8_t* mapping, const uint32_t* constants,
++                                   const uint64_t (&usage_map)[4]) {
++  for (uint32_t i = 0; i < 4; ++i) {
++    uint64_t bits = usage_map[i];
++    while (bits) {
++      const uint32_t first = uint32_t(std::countr_zero(bits));
++      const uint32_t run = uint32_t(std::countr_one(bits >> first));
++      const size_t size = sizeof(float) * 4 * run;
++      std::memcpy(mapping, constants + (i << 8) + (first << 2), size);
++      mapping += size;
++      bits = first + run >= 64 ? 0 : bits & (~UINT64_C(0) << (first + run));
++    }
++  }
++}
++
+ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+                                             const VulkanShader* pixel_shader) {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -6804,6 +7036,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
+   const RegisterFile& regs = *register_file_;
++  constexpr uint32_t kConstantsSetBit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
++  const bool constants_descriptor_was_valid =
++      (current_graphics_descriptor_set_values_up_to_date_ & kConstantsSetBit) != 0;
+ 
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+@@ -6896,18 +7131,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+         return false;
+       }
+       buffer_info.range = VkDeviceSize(float_constants_size);
+-      for (uint32_t i = 0; i < 4; ++i) {
+-        uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
+-        uint32_t float_constant_index;
+-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+-          float_constant_map_entry &= ~(1ull << float_constant_index);
+-          std::memcpy(
+-              mapping,
+-              &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
+-              sizeof(float) * 4);
+-          mapping += sizeof(float) * 4;
+-        }
+-      }
++      CopyUsedFloatConstants(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X],
++                             current_float_constant_map_vertex_);
+       current_constant_buffers_up_to_date_ |= UINT32_C(1)
+                                               << SpirvShaderTranslator::kConstantBufferFloatVertex;
+     }
+@@ -6925,18 +7150,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+         return false;
+       }
+       buffer_info.range = VkDeviceSize(float_constants_size);
+-      for (uint32_t i = 0; i < 4; ++i) {
+-        uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
+-        uint32_t float_constant_index;
+-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+-          float_constant_map_entry &= ~(1ull << float_constant_index);
+-          std::memcpy(
+-              mapping,
+-              &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
+-              sizeof(float) * 4);
+-          mapping += sizeof(float) * 4;
+-        }
+-      }
++      CopyUsedFloatConstants(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X],
++                             current_float_constant_map_pixel_);
+       current_constant_buffers_up_to_date_ |= UINT32_C(1)
+                                               << SpirvShaderTranslator::kConstantBufferFloatPixel;
+     }
+@@ -6976,6 +7191,34 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+   }
+ 
++  // Reuse descriptors when only the position of the uploaded data changed.
++  // The dynamic offsets retain the original alignment and allocated ranges.
++  bool offsets_changed = false;
++  for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
++    const VkDeviceSize offset = current_constant_buffer_infos_[i].offset;
++    if (offset > UINT32_MAX) {
++      REXGPU_ERROR("Uniform buffer offset exceeds Vulkan dynamic-offset range");
++      return false;
++    }
++    offsets_changed |= constant_dynamic_offsets_[i] != uint32_t(offset);
++    constant_dynamic_offsets_[i] = uint32_t(offset);
++  }
++  const bool same_constant_descriptors =
++      constant_descriptor_snapshot_.MatchAndRemember(current_constant_buffer_infos_);
++  if (constants_descriptor_was_valid && same_constant_descriptors) {
++#if REX_GPU_STAGE_STATS
++    if (!(current_graphics_descriptor_set_values_up_to_date_ & kConstantsSetBit)) {
++      ++cpu_stage_totals[9].calls;
++    }
++#endif
++    current_graphics_descriptor_set_values_up_to_date_ |= kConstantsSetBit;
++  } else {
++    current_graphics_descriptor_set_values_up_to_date_ &= ~kConstantsSetBit;
++  }
++  if (offsets_changed) {
++    current_graphics_descriptor_sets_bound_up_to_date_ &= ~kConstantsSetBit;
++  }
++
+   // Textures and samplers.
+   const std::vector<VulkanShader::SamplerBinding>& samplers_vertex =
+       vertex_shader->GetSamplerBindingsAfterTranslation();
+@@ -6997,10 +7240,36 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     sampler_count_pixel = 0;
+     texture_count_pixel = 0;
+   }
+-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
+-  current_graphics_descriptor_set_values_up_to_date_ &=
+-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
+-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
++  // Remember validity before rebuilding descriptions; only an already-valid
++  // set may be reused when its exact layout and contents match.
++  const uint32_t previous_descriptor_values = current_graphics_descriptor_set_values_up_to_date_;
++  const uint32_t previous_descriptor_bindings = current_graphics_descriptor_sets_bound_up_to_date_;
++  const uint64_t texture_epoch = texture_cache_->binding_usage_epoch();
++  auto keep_texture_descriptors = [&](unsigned stage, uint32_t set_index,
++      const VulkanShader* shader, VkDescriptorSetLayout layout, uint32_t texture_count,
++      const auto& samplers) {
++    const uint32_t bit = UINT32_C(1) << set_index;
++    const auto& snapshot = texture_descriptor_snapshots_[stage];
++    bool same = (previous_descriptor_values & bit) &&
++        descriptor_texture_shaders_[stage] == shader &&
++        descriptor_texture_epochs_[stage] == texture_epoch &&
++        snapshot.MatchesShape(layout, texture_count, samplers.size());
++    if (same) {
++      for (size_t i = 0; i < samplers.size(); ++i) {
++        if (!snapshot.MatchesSampler(i, samplers[i].second)) { same = false; break; }
++      }
++    }
++    if (!same) current_graphics_descriptor_set_values_up_to_date_ &= ~bit;
++#if REX_GPU_STAGE_STATS
++    else ++cpu_stage_totals[7].calls;
++#endif
++  };
++  keep_texture_descriptors(0, SpirvShaderTranslator::kDescriptorSetTexturesVertex,
++      vertex_shader, current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
++      texture_count_vertex, current_samplers_vertex_);
++  keep_texture_descriptors(1, SpirvShaderTranslator::kDescriptorSetTexturesPixel,
++      pixel_shader, current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
++      texture_count_pixel, current_samplers_pixel_);
+ 
+   // Make sure new descriptor sets are bound to the command buffer.
+ 
+@@ -7062,6 +7331,30 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+   }
+ 
++  auto reuse_textures = [&](unsigned stage, uint32_t set_index, VkDescriptorSetLayout layout,
++                            size_t offset, uint32_t textures, uint32_t samplers, bool& write) {
++    if (!write) return;
++    const bool same = texture_descriptor_snapshots_[stage].MatchAndRemember(layout, textures,
++        std::span<const VkDescriptorImageInfo>(descriptor_write_image_info_.data() + offset, textures + samplers));
++    descriptor_texture_shaders_[stage] = stage ? pixel_shader : vertex_shader;
++    descriptor_texture_epochs_[stage] = texture_cache_->binding_usage_epoch();
++    const uint32_t bit = UINT32_C(1) << set_index;
++    if (same && (previous_descriptor_values & bit)) {
++#if REX_GPU_STAGE_STATS
++      ++cpu_stage_totals[7].calls;
++#endif
++      current_graphics_descriptor_set_values_up_to_date_ |= bit;
++      current_graphics_descriptor_sets_bound_up_to_date_ |= previous_descriptor_bindings & bit;
++      write = false;
++    }
++  };
++  reuse_textures(0, SpirvShaderTranslator::kDescriptorSetTexturesVertex,
++      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
++      vertex_texture_image_info_offset, texture_count_vertex, sampler_count_vertex, write_vertex_textures);
++  reuse_textures(1, SpirvShaderTranslator::kDescriptorSetTexturesPixel,
++      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
++      pixel_texture_image_info_offset, texture_count_pixel, sampler_count_pixel, write_pixel_textures);
++
+   // Write the new descriptor sets.
+ 
+   // Consecutive bindings updated via a single VkWriteDescriptorSet must have
+@@ -7082,9 +7375,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+       constants_transient_descriptors_free_.pop_back();
+     } else {
+       VkDescriptorPoolSize constants_descriptor_count;
+-      constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++      constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+       constants_descriptor_count.descriptorCount = SpirvShaderTranslator::kConstantBufferCount;
+-      constants_descriptor_set = transient_descriptor_allocator_uniform_buffer_.Allocate(
++      constants_descriptor_set = transient_descriptor_allocator_dynamic_uniform_buffer_.Allocate(
+           descriptor_set_layout_constants_, &constants_descriptor_count, 1);
+       if (constants_descriptor_set == VK_NULL_HANDLE) {
+         return false;
+@@ -7101,9 +7394,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+       write_constants.dstBinding = i;
+       write_constants.dstArrayElement = 0;
+       write_constants.descriptorCount = 1;
+-      write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++      write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+       write_constants.pImageInfo = nullptr;
+-      write_constants.pBufferInfo = &current_constant_buffer_infos_[i];
++      write_constants.pBufferInfo = constant_descriptor_snapshot_.data() + i;
+       write_constants.pTexelBufferView = nullptr;
+     }
+     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
+@@ -7167,11 +7460,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+   while (rex::bit_scan_forward(descriptor_sets_remaining, &descriptor_set_index)) {
+     uint32_t descriptor_set_mask_tzcnt =
+         rex::tzcnt(~(descriptor_sets_remaining | ((UINT32_C(1) << descriptor_set_index) - 1)));
++    const bool binds_constants =
++        descriptor_set_index <= SpirvShaderTranslator::kDescriptorSetConstants &&
++        descriptor_set_mask_tzcnt > SpirvShaderTranslator::kDescriptorSetConstants;
+     deferred_command_buffer_.CmdVkBindDescriptorSets(
+         VK_PIPELINE_BIND_POINT_GRAPHICS,
+         current_guest_graphics_pipeline_layout_->GetPipelineLayout(), descriptor_set_index,
+         descriptor_set_mask_tzcnt - descriptor_set_index,
+-        current_graphics_descriptor_sets_ + descriptor_set_index, 0, nullptr);
++        current_graphics_descriptor_sets_ + descriptor_set_index,
++        binds_constants ? uint32_t(constant_dynamic_offsets_.size()) : 0,
++        binds_constants ? constant_dynamic_offsets_.data() : nullptr);
+     if (descriptor_set_mask_tzcnt >= 32) {
+       break;
+     }
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 315ea89..dd167ec 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -10,6 +11,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <array>
+ #include <atomic>
+ #include <cstdint>
+@@ -408,6 +410,9 @@ bool VulkanPipelineCache::Initialize() {
+ 
+ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                                   uint32_t title_id, bool blocking) {
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto GPU init] shader storage callback entered\n"); fflush(stderr);
++#endif
+   ShutdownShaderStorage();
+   {
+     std::lock_guard<std::mutex> lock(creation_request_lock_);
+@@ -720,6 +725,15 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+            pipeline_storage_file_);
+   }
+ 
++  // C update streams require positioning between reading and writing, even
++  // when truncation leaves the current position exactly at the end.
++  if (!rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END) ||
++      !rex::filesystem::Seek(shader_storage_file_, 0, SEEK_END)) {
++    REXGPU_ERROR("Unable to position shader cache streams for appending");
++    ShutdownShaderStorage();
++    return;
++  }
++
+   shader_storage_cache_root_ = cache_root;
+   shader_storage_title_id_ = title_id;
+ 
+@@ -762,6 +776,9 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
+ }
+ 
+ void VulkanPipelineCache::EndSubmission() {
++#if REX_PLATFORM_PS5
++  const auto perf_begin = std::chrono::steady_clock::now();
++#endif
+   if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
+     {
+       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+@@ -806,6 +823,17 @@ void VulkanPipelineCache::EndSubmission() {
+     }
+   }
+ 
++#if REX_PLATFORM_PS5
++  const auto perf_end = std::chrono::steady_clock::now();
++  static auto perf_window = perf_end;
++  static double perf_total_ms = 0, perf_max_ms = 0;
++  const double perf_ms = std::chrono::duration<double, std::milli>(perf_end - perf_begin).count();
++  perf_total_ms += perf_ms; perf_max_ms = std::max(perf_max_ms, perf_ms);
++  if (std::chrono::duration<double>(perf_end - perf_window).count() >= 5) {
++    REXGPU_INFO("PS5 pipeline waits: total_ms={:.1f} max_ms={:.1f}", perf_total_ms, perf_max_ms);
++    perf_window = perf_end; perf_total_ms = perf_max_ms = 0;
++  }
++#endif
+   ProcessDeferredPipelineDestructions(false);
+ }
+ 
+@@ -3687,7 +3715,7 @@ void VulkanPipelineCache::StorageWriteThread() {
+         storage_write_flush_pipelines_ = false;
+         flush_pipelines = true;
+       }
+-      if (!shader && !write_pipeline) {
++      if (!shader && !write_pipeline && !flush_shaders && !flush_pipelines) {
+         storage_write_request_cond_.wait(lock);
+         continue;
+       }
+@@ -3712,7 +3740,9 @@ void VulkanPipelineCache::StorageWriteThread() {
+ 
+     if (write_pipeline) {
+       assert_not_null(pipeline_storage_file_);
+-      fwrite(&pipeline_description, sizeof(pipeline_description), 1, pipeline_storage_file_);
++      if (fwrite(&pipeline_description, sizeof(pipeline_description), 1, pipeline_storage_file_) != 1) {
++        REXGPU_ERROR("Failed to append Vulkan pipeline cache record");
++      }
+     }
+   }
+ }
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index d0477f1..3ec09cd 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -4598,6 +4598,20 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+     const Transfer::Rectangle* resolve_clear_rectangle) {
+   assert_true(GetPath() == Path::kHostRenderTargets);
+ 
++  // Every draw calls this; most have nothing to transfer or clear.
++  if (!(render_target_resolve_clear_values && resolve_clear_rectangle)) {
++    bool any_transfers = false;
++    for (uint32_t i = 0; render_target_transfers && i < render_target_count; ++i) {
++      if (render_targets[i] && !render_target_transfers[i].empty()) {
++        any_transfers = true;
++        break;
++      }
++    }
++    if (!any_transfers) {
++      return;
++    }
++  }
++
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   uint64_t current_submission = command_processor_.GetCurrentSubmission();
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index 3353540..de3a51d 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -555,7 +556,17 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  // Always process guest-memory invalidation before considering the fast path.
+   TextureCache::RequestTextures(used_texture_mask);
++  const uint64_t submission = command_processor_.GetCurrentSubmission();
++  const bool wrappers_3d = REXCVAR_GET(gpu_3d_to_2d_texture);
++  if (wrappers_3d != requested_texture_3d_wrappers_) ++texture_usage_epoch_;
++  if (requested_texture_epoch_ == texture_usage_epoch_ &&
++      requested_texture_submission_ == submission &&
++      requested_texture_mask_ == used_texture_mask &&
++      requested_texture_3d_wrappers_ == wrappers_3d) {
++    return;
++  }
+ 
+   // Pre-create 3D-as-2D wrappers while still in texture request phase.
+   if (REXCVAR_GET(gpu_3d_to_2d_texture)) {
+@@ -626,6 +637,10 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
+       }
+     }
+   }
++  requested_texture_epoch_ = texture_usage_epoch_;
++  requested_texture_submission_ = submission;
++  requested_texture_mask_ = used_texture_mask;
++  requested_texture_3d_wrappers_ = wrappers_3d;
+ }
+ 
+ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
+@@ -676,6 +691,20 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
+   const auto& regs = register_file();
+   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
+ 
++  const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
++  const bool allow_invalid_fetch = REXCVAR_GET(gpu_allow_invalid_fetch_constants);
++  SamplerParameterMemo& memo = sampler_parameter_memos_[binding.fetch_constant];
++  if (memo.valid && memo.binding.mag_filter == binding.mag_filter &&
++      memo.binding.min_filter == binding.min_filter &&
++      memo.binding.mip_filter == binding.mip_filter &&
++      memo.binding.aniso_filter == binding.aniso_filter &&
++      memo.anisotropic_override == anisotropic_override &&
++      memo.max_anisotropy == max_anisotropy_ &&
++      memo.allow_invalid_fetch == allow_invalid_fetch &&
++      !std::memcmp(&memo.fetch, &fetch, sizeof(fetch))) {
++    return memo.parameters;
++  }
++
+   SamplerParameters parameters;
+ 
+   xenos::ClampMode fetch_clamp_x, fetch_clamp_y, fetch_clamp_z;
+@@ -741,7 +770,6 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
+                                                  &mip_min_level, &mip_max_level);
+   parameters.mip_min_level = mip_min_level;
+   bool has_mips = mip_max_level > mip_min_level;
+-  int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+   if (anisotropic_override > -1 && anisotropic_override < 6 && has_mips &&
+       !parameters.mip_base_map && min_mag_linear && mip_filter_bilinear_or_trilinear) {
+     aniso_filter = xenos::AnisoFilter(anisotropic_override);
+@@ -755,12 +783,28 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
+   }
+   parameters.aniso_filter = aniso_filter;
+ 
++  memo.binding = binding;
++  memo.fetch = fetch;
++  memo.anisotropic_override = anisotropic_override;
++  memo.max_anisotropy = max_anisotropy_;
++  memo.allow_invalid_fetch = allow_invalid_fetch;
++  memo.parameters = parameters;
++  memo.valid = true;
+   return parameters;
+ }
+ 
+ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has_overflown_out) {
+   assert_true(command_processor_.submission_open());
+   uint64_t submission_current = command_processor_.GetCurrentSubmission();
++  // A sampler marked used in this submission cannot be evicted until a later
++  // submission. Exact-key hits therefore need neither a hash lookup nor an LRU update.
++  SubmissionSampler& recent = submission_samplers_[
++      (parameters.value * UINT32_C(2654435761)) >> 26];
++  if (recent.sampler != VK_NULL_HANDLE && recent.submission == submission_current &&
++      recent.parameters == parameters.value) {
++    has_overflown_out = false;
++    return recent.sampler;
++  }
+ 
+   // Try to find an existing sampler.
+   auto it_existing = samplers_.find(parameters);
+@@ -785,6 +829,7 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
+       }
+     }
+     has_overflown_out = false;
++    recent = {submission_current, parameters.value, sampler.second.sampler};
+     return sampler.second.sampler;
+   }
+ 
+@@ -957,6 +1002,7 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
+     sampler_used_first_ = &new_sampler;
+   }
+   sampler_used_last_ = &new_sampler;
++  recent = {submission_current, parameters.value, vulkan_sampler};
+   return vulkan_sampler;
+ }
+ 
+@@ -1800,6 +1846,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+ }
+ 
+ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {
++  ++texture_usage_epoch_;
+   uint32_t bindings_remaining = fetch_constant_mask;
+   uint32_t binding_index;
+   while (rex::bit_scan_forward(bindings_remaining, &binding_index)) {
+@@ -2940,9 +2987,15 @@ bool VulkanTextureCache::Initialize() {
+     }
+     const std::pair<const uint32_t*, size_t>& current_load_shader_code = load_shader_code[i];
+     assert_not_null(current_load_shader_code.first);
++#if REX_PLATFORM_PS5
++    fprintf(stderr, "[Naruto GPU init] texture pipeline %zu begin\n", i); fflush(stderr);
++#endif
+     load_pipelines_[i] = ui::vulkan::util::CreateComputePipeline(
+         vulkan_device, load_pipeline_layout_, current_load_shader_code.first,
+         current_load_shader_code.second);
++#if REX_PLATFORM_PS5
++    fprintf(stderr, "[Naruto GPU init] texture pipeline %zu end\n", i); fflush(stderr);
++#endif
+     if (load_pipelines_[i] == VK_NULL_HANDLE) {
+       REXGPU_ERROR(
+           "VulkanTextureCache: Failed to create the texture loading pipeline "
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index 57f65c4..57f29f0 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -177,8 +178,17 @@ X_STATUS SDLInputDriver::Setup() {
+ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+   if (window && !attached_window_) {
+     attached_window_ = window;
++#if REX_PLATFORM_PS5
++      fprintf(stderr, "[Naruto init] SDL add listener\n"); fflush(stderr);
++#endif
+     window->AddListener(this);
++#if REX_PLATFORM_PS5
++      fprintf(stderr, "[Naruto init] SDL UI dispatch\n"); fflush(stderr);
++#endif
+     window->app_context().CallInUIThreadSynchronous([this]() {
++#if REX_PLATFORM_PS5
++      fprintf(stderr, "[Naruto init] SDL events\n"); fflush(stderr);
++#endif
+       // Initialize SDL events subsystem
+       if (!SDL_InitSubSystem(SDL_INIT_EVENTS)) {
+         REXLOG_ERROR("SDL: Failed to init events subsystem: {}", SDL_GetError());
+@@ -211,6 +221,9 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+           },
+           this);
+ 
++#if REX_PLATFORM_PS5
++      fprintf(stderr, "[Naruto init] SDL gamepads\n"); fflush(stderr);
++#endif
+       // Initialize game controller subsystem
+       if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+         REXLOG_ERROR("SDL: Failed to init gamecontroller subsystem: {}", SDL_GetError());
+@@ -218,10 +231,20 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+       }
+       SDL_Gamepad_initialized_ = true;
+ 
++#if REX_PLATFORM_PS5
++      fprintf(stderr, "[Naruto init] SDL mappings\n"); fflush(stderr);
++#endif
+       // Load custom controller mappings if available
+       if (!REXCVAR_GET(hid_mappings_file).empty()) {
+         std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
+-        if (!std::filesystem::exists(mappings_path)) {
++#if REX_PLATFORM_PS5
++        fprintf(stderr, "[Naruto init] mappings exists %s\n", mappings_path.c_str()); fflush(stderr);
++#endif
++        std::error_code mappings_error;
++        if (!std::filesystem::exists(mappings_path, mappings_error)) {
++#if REX_PLATFORM_PS5
++          fprintf(stderr, "[Naruto init] mappings absent; logging\n"); fflush(stderr);
++#endif
+           REXLOG_WARN("SDL GameControllerDB: file '{}' does not exist.",
+                       REXCVAR_GET(hid_mappings_file));
+         } else {
+@@ -235,7 +258,13 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+           }
+         }
+       }
++#if REX_PLATFORM_PS5
++      fprintf(stderr, "[Naruto init] SDL initialized; logging\n"); fflush(stderr);
++#endif
+       REXLOG_INFO("SDL input driver initialized successfully");
++#if REX_PLATFORM_PS5
++      fprintf(stderr, "[Naruto init] SDL attach done\n"); fflush(stderr);
++#endif
+     });
+   }
+ }
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 86c4353..f029acf 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -219,6 +219,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+       *disposition_ptr = static_cast<uint32_t>(disposition);
+     }
+ 
++#if REX_PLATFORM_PS5
++    REXKRNL_INFO("Save content mount: root={} file={} flags={:X} result={:X} disposition={}",
++                 root_name, content_data.file_name(), uint32_t(flags), result, uint32_t(disposition));
++#endif
+     extended_error = X_HRESULT_FROM_WIN32(result);
+     length = static_cast<uint32_t>(disposition);
+     return result;
+diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
+index 6e9ac8a..f971e1b 100644
+--- a/src/kernel/xam/xam_net.cpp
++++ b/src/kernel/xam/xam_net.cpp
+@@ -37,7 +37,7 @@
+ // NOTE: must be included last as it expects windows.h to already be included.
+ #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
+ #include <winsock2.h>                    // NOLINT(build/include_order)
+-#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5
+ #include <arpa/inet.h>
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..535d0fe 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -226,7 +226,7 @@ u32 NtSuspendThread_entry(u32 handle, mapped_u32 suspend_count_ptr) {
+     }
+ 
+     REXKRNL_TRACE("[NtSuspendThread] handle={:08X} thread={}", uint32_t(handle), thread->name());
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5
+     auto* current_thread = XThread::GetCurrentThread();
+     bool is_self_suspend = current_thread && current_thread == thread.get();
+     if (is_self_suspend) {
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index 05979a3..623717c 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -48,7 +48,11 @@ set(REXSYSTEM_SOURCES
+     xex_module.cpp
+ )
+ 
+-add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
++if(PS5)
++    add_library(rexruntime STATIC ${REXSYSTEM_SOURCES})
++else()
++    add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
++endif()
+ add_library(rex::runtime ALIAS rexruntime)
+ add_library(rex::system ALIAS rexruntime)
+ add_library(rex::kernel ALIAS rexruntime)
+diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
+index bd43109..0dcec66 100644
+--- a/src/system/function_dispatcher.cpp
++++ b/src/system/function_dispatcher.cpp
+@@ -13,6 +13,10 @@
+  *              role as a function dispatch table rather than a CPU emulator.
+  */
+ 
++#include <string>
++
++#include <fmt/format.h>
++
+ #include <rex/assert.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+@@ -34,9 +38,19 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
+ 
+ }  // namespace
+ 
+-static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
+-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
+-            ctx.last_indirect_target);
++static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
++  // Stack words near r1 (mapped: the guest stack) usually hold the saved LRs of
++  // the calling frames, so the call chain can be read from the dump.
++  std::string stack;
++  for (uint32_t i = 0; base && i < 48; ++i) {
++    stack += fmt::format(" {:08X}", memory::load_and_swap<uint32_t>(base + ctx.r1.u32 + i * 4));
++  }
++  REX_FATAL(
++      "Call to invalid or unregistered function at guest address 0x{:08X} (lr={:08X} "
++      "ctr={:08X} r1={:08X} r3={:08X} r4={:08X} r5={:08X} r11={:08X} r12={:08X} r29={:08X} "
++      "r30={:08X} r31={:08X} stack:{})",
++      ctx.last_indirect_target, uint32_t(ctx.lr), ctx.ctr.u32, ctx.r1.u32, ctx.r3.u32, ctx.r4.u32,
++      ctx.r5.u32, ctx.r11.u32, ctx.r12.u32, ctx.r29.u32, ctx.r30.u32, ctx.r31.u32, stack);
+ }
+ 
+ PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+index 754fa13..7e8ba1c 100644
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -24,6 +24,12 @@
+ 
+ namespace rex::system {
+ 
++#if REX_PLATFORM_PS5
++extern "C" uint32_t rex_gpu_abi_version(void);
++extern "C" IGraphicsSystem* rex_gpu_create(uint32_t abi_version,
++                                            const GpuCreateInfo* info);
++#endif
++
+ namespace {
+ 
+ // Plugin binaries follow the SDK's per-config postfix convention; this TU is
+@@ -55,6 +61,21 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
+ }  // namespace
+ 
+ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
++#if REX_PLATFORM_PS5
++  if (name != "xenos") {
++    REXSYS_ERROR("No statically linked PS5 GPU plugin named '{}'", name);
++    return nullptr;
++  }
++  if (rex_gpu_abi_version() != kGpuPluginAbiVersion) {
++    REXSYS_ERROR("Statically linked PS5 Xenos plugin ABI mismatch");
++    return nullptr;
++  }
++  std::string backend_str(backend);
++  GpuCreateInfo info{};
++  info.struct_size = sizeof(GpuCreateInfo);
++  info.backend = backend_str.c_str();
++  return std::unique_ptr<IGraphicsSystem>(rex_gpu_create(kGpuPluginAbiVersion, &info));
++#else
+   auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
+   if (!std::filesystem::exists(path)) {
+     REXSYS_ERROR(
+@@ -100,6 +121,7 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
+   LoadedPlugins().push_back(std::move(library));
+   REXSYS_DEBUG("GPU plugin '{}' loaded ({})", name, path.filename().string());
+   return std::unique_ptr<IGraphicsSystem>(graphics_system);
++#endif
+ }
+ 
+ }  // namespace rex::system
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 697399c..17d9d4e 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -45,6 +45,13 @@
+ 
+ namespace rex::system {
+ 
++#if REX_PLATFORM_PS5
++using BuiltinImageInfoFn = const rex::PPCImageInfo* (*)();
++extern "C" bool rex_ps5_resolve_builtin_module(
++    const char* module_name, runtime::FunctionDispatcher::RegisterFn* register_fn,
++    BuiltinImageInfoFn* image_info_fn) __attribute__((weak));
++#endif
++
+ constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
+ 
+ // This is a global object initialized with the XboxkrnlModule.
+@@ -748,6 +755,34 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
+   if (recomp && !recomp->shared_lib_name.empty()) {
+     const std::string& lib_key = recomp->guest_path;
+ 
++#if REX_PLATFORM_PS5
++    runtime::FunctionDispatcher::RegisterFn register_func = nullptr;
++    BuiltinImageInfoFn get_image_info = nullptr;
++    if (!rex_ps5_resolve_builtin_module ||
++        !rex_ps5_resolve_builtin_module(recomp->shared_lib_name.c_str(), &register_func,
++                                        &get_image_info) ||
++        !register_func || !get_image_info) {
++      REXSYS_ERROR("Built-in PS5 recompiled module '{}' is unavailable",
++                   recomp->shared_lib_name);
++      object_table()->ReleaseHandle(module->handle());
++      return nullptr;
++    }
++    auto* xex = module->xex_module();
++    const auto* image_info = get_image_info();
++    if (!image_info || image_info->image_base != xex->base_address() ||
++        image_info->image_size != xex->image_size() ||
++        !function_dispatcher_->InitializeFunctionTable(
++            image_info->code_base, image_info->code_size, image_info->image_base,
++            image_info->image_size)) {
++      REXSYS_ERROR("Built-in PS5 recompiled module '{}' layout is invalid",
++                   recomp->shared_lib_name);
++      object_table()->ReleaseHandle(module->handle());
++      return nullptr;
++    }
++    function_dispatcher_->RegisterModule(lib_key, image_info->code_base, register_func);
++    wired_recomp = true;
++#else
++
+     {
+       auto global_lock = global_critical_region_.Acquire();
+       auto [lib_it, inserted] = module_libraries_.emplace(lib_key, rex::platform::DynamicLibrary{});
+@@ -806,6 +841,7 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
+       object_table()->ReleaseHandle(module->handle());
+       return nullptr;
+     }
++#endif
+   }
+ 
+   {
+@@ -864,11 +900,13 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module, bool ca
+       }
+ 
+       if (!recomp->shared_lib_name.empty()) {
++#if !REX_PLATFORM_PS5
+         auto lib_it = module_libraries_.find(key);
+         if (lib_it != module_libraries_.end()) {
+           deferred_unload_libraries_.push_back(std::move(lib_it->second));
+           module_libraries_.erase(lib_it);
+         }
++#endif
+       }
+     }
+ 
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index c10694c..56751c2 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ /**
+  * @file        runtime/runtime.cpp
+  * @brief       Runtime subsystem implementation
+@@ -193,6 +194,9 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
+   }
+ 
+   REXSYS_DEBUG("Runtime initialized successfully");
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto init] runtime setup complete\n"); fflush(stderr);
++#endif
+   setup_complete_ = true;
+   return X_STATUS_SUCCESS;
+ }
+@@ -223,16 +227,25 @@ X_STATUS Runtime::Setup(const rex::PPCImageInfo& image_info, RuntimeConfig confi
+       if (!host) {
+         continue;
+       }
++#if REX_PLATFORM_PS5
++      if (i < 3 || i % 4096 == 0) { fprintf(stderr, "[Naruto init] mapping %d guest %08x host %p lookup\n", i, guest, (void*)host); fflush(stderr); }
++#endif
+       if (function_dispatcher_->GetFunction(guest)) {
+         REXSYS_WARN("func_mappings: duplicate guest address {:08X}", guest);
+         ++duplicates;
+       }
++#if REX_PLATFORM_PS5
++      if (i < 3) { fprintf(stderr, "[Naruto init] mapping %d set\n", i); fflush(stderr); }
++#endif
+       if (!function_dispatcher_->SetFunction(guest, host)) {
+         ++rejected;
+       } else {
+         ++count;
+       }
+     }
++#if REX_PLATFORM_PS5
++    fprintf(stderr, "[Naruto init] function mappings complete count %d\n", count); fflush(stderr);
++#endif
+     REXSYS_DEBUG("Registered {} recompiled functions ({} duplicates, {} rejected)", count,
+                  duplicates, rejected);
+     if (rejected > 0) {
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index d0c7bfd..c49a7fc 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -17,6 +17,7 @@
+ #include <fmt/format.h>
+ 
+ #include <rex/filesystem.h>
++#include <rex/filesystem/case_path.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/stfs_container_device.h>
+ #include <rex/string.h>
+@@ -111,7 +112,7 @@ std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
+   // Content path:
+   // content_root/xuid/title_id/content_type/data_file_name/
+   auto package_root = ResolvePackageRoot(used_xuid, data.content_type, data.title_id);
+-  return package_root / rex::to_path(data.file_name());
++  return rex::filesystem::ResolveCaseInsensitiveLeaf(package_root / rex::to_path(data.file_name()));
+ }
+ 
+ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string_view file_name,
+@@ -132,8 +133,8 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
+ 
+   // Header root path:
+   // content_root/xuid/title_id/Headers/content_type/filename.header
+-  return root_path_ / xuid_str / title_id_str / kGameContentHeaderDirName / content_type_str /
+-         final_name;
++  return rex::filesystem::ResolveCaseInsensitiveLeaf(
++      root_path_ / xuid_str / title_id_str / kGameContentHeaderDirName / content_type_str / final_name);
+ }
+ 
+ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device_id, uint64_t xuid,
+diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
+index 4179e8b..cc3491f 100644
+--- a/src/system/xfile.cpp
++++ b/src/system/xfile.cpp
+@@ -180,6 +180,14 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
+     }
+   }
+ 
++#if REX_PLATFORM_PS5
++  if (file_->entry()->absolute_path().find("Content") != std::string::npos) {
++    REXFS_INFO("Content read: path={} buffer={:08X} offset={} length={} bytes={} status={:08X}",
++               file_->entry()->absolute_path(), buffer_guest_address, byte_offset,
++               buffer_length, bytes_read, result);
++  }
++#endif
++
+   if (out_bytes_read) {
+     *out_bytes_read = uint32_t(bytes_read);
+   }
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..6c39358 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -2133,25 +2133,19 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
+       assert_always();
+       continue;
+     }
+-    rex::memory::PageAccess current_page_access =
+-        ToPageAccess(page_table_[guest_page_number].current_protect);
+     bool protect_system_page = false;
+-    // Don't do anything with inaccessible pages - don't protect, don't enable
+-    // callbacks - because real access violations are needed there. And don't
+-    // enable invalidation notifications for read-only pages for the same
+-    // reason.
+-    if (current_page_access != rex::memory::PageAccess::kNoAccess) {
+-      // TODO(Triang3l): Enable data providers.
+-      if (enable_invalidation_notifications) {
+-        if (current_page_access != rex::memory::PageAccess::kReadOnly &&
+-            (page_flags_block.notify_on_invalidation & page_flags_bit) == 0) {
+-          // TODO(Triang3l): Check if data providers are already enabled.
+-          // If data providers are already enabled for the page, it has even
+-          // stricter protection.
+-          protect_system_page = true;
+-          page_flags_block.notify_on_invalidation |= page_flags_bit;
+-        }
+-      }
++    // Don't do anything with pages the guest can't write - don't protect, don't
++    // enable callbacks - because real access violations are needed there. A
++    // host page may hold several guest pages (16 KB host pages on PS5): watch it
++    // if any of them is writable, or writes to the others are never noticed.
++    // TODO(Triang3l): Enable data providers.
++    if (enable_invalidation_notifications && IsSystemPageGuestWritable(i) &&
++        (page_flags_block.notify_on_invalidation & page_flags_bit) == 0) {
++      // TODO(Triang3l): Check if data providers are already enabled.
++      // If data providers are already enabled for the page, it has even
++      // stricter protection.
++      protect_system_page = true;
++      page_flags_block.notify_on_invalidation |= page_flags_bit;
+     }
+     if (protect_system_page) {
+       if (protect_system_page_first == UINT32_MAX) {
+@@ -2172,6 +2166,37 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
+   }
+ }
+ 
++bool PhysicalHeap::IsSystemPageGuestWritable(uint32_t system_page) const {
++  if (page_table_.empty()) {
++    return false;
++  }
++  const uint32_t page_first =
++      rex::sat_sub(system_page * system_page_size_, host_address_offset()) >> page_size_shift_;
++  const uint32_t page_last = std::min(
++      rex::sat_sub(system_page * system_page_size_ + (system_page_size_ - 1),
++                   host_address_offset()) >>
++          page_size_shift_,
++      uint32_t(page_table_.size() - 1));
++  auto writable = [&](uint32_t page) {
++    const rex::memory::PageAccess access = ToPageAccess(page_table_[page].current_protect);
++    return access != rex::memory::PageAccess::kNoAccess &&
++           access != rex::memory::PageAccess::kReadOnly;
++  };
++  // Committed pages decide, like the host page access reconciliation; a host
++  // page with no committed guest pages keeps the first page's state.
++  bool any_committed = false;
++  for (uint32_t page = page_first; page <= page_last; ++page) {
++    if (!(page_table_[page].state & memory::kMemoryAllocationCommit)) {
++      continue;
++    }
++    any_committed = true;
++    if (writable(page)) {
++      return true;
++    }
++  }
++  return !any_committed && writable(page_first);
++}
++
+ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
+                                     uint32_t virtual_address, uint32_t length, bool is_write,
+                                     bool unwatch_exact_range, bool unprotect) {
+@@ -2286,13 +2311,8 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
+       // Check if need to allow writing to this page.
+       bool unprotect_page =
+           (system_page_flags_[i >> 6].notify_on_invalidation & (uint64_t(1) << (i & 63))) != 0;
+-      if (unprotect_page) {
+-        uint32_t guest_page_number =
+-            rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
+-        if (ToPageAccess(page_table_[guest_page_number].current_protect) !=
+-            rex::memory::PageAccess::kReadWrite) {
+-          unprotect_page = false;
+-        }
++      if (unprotect_page && !IsSystemPageGuestWritable(i)) {
++        unprotect_page = false;
+       }
+       if (unprotect_page) {
+         if (unprotect_system_page_first == UINT32_MAX) {
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..b4c4de0 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -433,6 +434,9 @@ X_STATUS XThread::Create() {
+   params.stack_size = 16_MiB;  // Allocate a big host stack.
+   params.create_suspended = true;
+   thread_ = rex::thread::Thread::Create(params, [this]() {
++#if REX_PLATFORM_PS5
++    fprintf(stderr, "[Naruto thread] XThread binding %08x\n", handle()); fflush(stderr);
++#endif
+     rex::initialize_seh_thread();
+     runtime::ThreadState::Bind(thread_state_.get());
+ 
+@@ -445,6 +449,9 @@ X_STATUS XThread::Create() {
+     PROFILE_THREAD_ENTER(thread_name_.c_str());
+     PROFILE_THREAD_CREATED();
+ 
++#if REX_PLATFORM_PS5
++    fprintf(stderr, "[Naruto thread] XThread execute %08x\n", handle()); fflush(stderr);
++#endif
+     // Execute user code.
+     current_xthread_tls_ = this;
+     running_ = true;
+@@ -938,7 +945,7 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
+     *out_suspend_count = previous_suspend_count;
+   }
+   return thread_->Resume(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
+-#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5
+   bool should_resume_host = false;
+   {
+     std::lock_guard<std::mutex> lock(suspend_mutex_);
+@@ -986,7 +993,7 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
+   return thread_->Suspend(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
+ }
+ 
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5
+ uint32_t XThread::SelfSuspend() {
+   auto guest_thread = guest_object<X_KTHREAD>();
+   std::unique_lock<std::mutex> lock(suspend_mutex_);
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 5bd3dc5..539764d 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -64,7 +64,11 @@ if(REXGLUE_USE_D3D12)
+ endif()
+ 
+ # Platform-specific sources (windowing itself is SDL3, platform-independent)
+-if(WIN32)
++if(PS5)
++    # The native backend presents through VK_KHR_display and does not require a
++    # platform window-system surface translation unit.
++    set(REXUI_PLATFORM_SOURCES)
++elseif(WIN32)
+     set(REXUI_PLATFORM_SOURCES
+         surface_win.cpp
+     )
+@@ -146,7 +150,9 @@ if(REXGLUE_USE_VULKAN)
+ endif()
+ 
+ # Platform-specific dependencies
+-if(UNIX AND NOT APPLE)
++if(PS5)
++    # Native presentation uses VK_KHR_display and has no X11/Wayland headers.
++elseif(UNIX AND NOT APPLE)
+     find_package(PkgConfig REQUIRED)
+     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every
+@@ -173,4 +179,3 @@ endif()
+ if(REXGLUE_USE_D3D12)
+     target_link_libraries(rexui PUBLIC dxc-headers)
+ endif()
+-
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 306118e..65b07b5 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -52,6 +52,8 @@ namespace shaders {
+ }  // namespace shaders
+ 
+ D3D12Presenter::~D3D12Presenter() {
++  ShutdownFramePacing();
++
+   // Await completion of the usage of everything before destroying anything.
+   // From most likely the latest to most likely the earliest to be signaled, so
+   // just one sleep will likely be needed.
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..dfdfac6 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cctype>
++#include <chrono>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -26,6 +27,11 @@
+ #include <ffx_api/ffx_upscale.h>
+ #endif
+ 
++REXCVAR_DEFINE_BOOL(present_frame_pacing, false, "UI/Presenter",
++                    "Present from a dedicated thread once per display refresh so each guest "
++                    "frame stays on screen for whole, even refresh counts (FIFO displays)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+                     "Allow presentation from non-UI thread");
+ 
+@@ -287,6 +293,8 @@ Presenter::~Presenter() {
+   // it if needed.
+   assert_false(is_executing_ui_drawers_);
+ 
++  ShutdownFramePacing();
++
+ #if REX_PLATFORM_WIN32
+   if (dxgi_ui_tick_thread_.joinable()) {
+     {
+@@ -613,6 +621,24 @@ bool Presenter::RefreshGuestOutput(
+     guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
+   }
+ 
++  if (frame_pacing_thread_.joinable()) {
++    const uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                         std::chrono::steady_clock::now().time_since_epoch())
++                                         .count());
++    {
++      std::lock_guard<std::mutex> lock(frame_pacing_mutex_);
++      if (frame_pacing_last_publish_ns_) {
++        const double delta_ms =
++            std::clamp(double(now_ns - frame_pacing_last_publish_ns_) / 1e6, 5.0, 100.0);
++        frame_pacing_interval_ms_ = frame_pacing_interval_ms_ * 0.75 + delta_ms * 0.25;
++      }
++      frame_pacing_last_publish_ns_ = now_ns;
++      ++frame_pacing_published_;
++    }
++    frame_pacing_condition_.notify_one();
++    return is_active;
++  }
++
+   // Trigger the presentation on the host.
+   PaintResult paint_result = PaintResult::kNotPresented;
+   {
+@@ -796,9 +822,96 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
+   dxgi_ui_tick_thread_ = std::thread(&Presenter::DXGIUITickThread, this);
+ #endif  // XE_PLATFORM
+ 
++  if (REXCVAR_GET(present_frame_pacing)) {
++    frame_pacing_thread_ = std::thread(&Presenter::FramePacingThread, this);
++  }
++
+   return true;
+ }
+ 
++void Presenter::ShutdownFramePacing() {
++  if (!frame_pacing_thread_.joinable()) {
++    return;
++  }
++  {
++    std::lock_guard<std::mutex> lock(frame_pacing_mutex_);
++    frame_pacing_shutdown_ = true;
++  }
++  frame_pacing_condition_.notify_all();
++  frame_pacing_thread_.join();
++}
++
++void Presenter::FramePacingThread() {
++  uint64_t consumed = 0;
++  // Display refreshes (presents) the current guest frame has been queued for.
++  uint32_t shown_refreshes = 0;
++  // Whether frames are arriving; while idle, wait for the next one instead of
++  // presenting the same image every refresh.
++  bool streaming = false;
++  for (;;) {
++    uint64_t published;
++    double interval_ms;
++    {
++      std::unique_lock<std::mutex> lock(frame_pacing_mutex_);
++      if (!streaming) {
++        frame_pacing_condition_.wait(lock, [&] {
++          return frame_pacing_shutdown_ || frame_pacing_published_ != consumed;
++        });
++      }
++      if (frame_pacing_shutdown_) {
++        return;
++      }
++      published = frame_pacing_published_;
++      interval_ms = frame_pacing_interval_ms_;
++    }
++    // 60 Hz display: guest frames at 30 FPS take two refreshes, at 60 FPS one.
++    const uint32_t refreshes_per_frame = interval_ms > 25.0 ? 2 : 1;
++    const bool new_frame = published != consumed;
++    const bool consume = new_frame && (!streaming || shown_refreshes >= refreshes_per_frame);
++    if (!consume && shown_refreshes >= refreshes_per_frame + 2) {
++      // The guest stopped producing frames (loading, pause): the display keeps
++      // the last image; wait for the next frame.
++      streaming = false;
++      continue;
++    }
++    PaintResult paint_result = PaintResult::kNotPresented;
++    bool painted = false;
++    {
++      std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
++      if (paint_mode_ == PaintMode::kGuestOutputThreadImmediately) {
++        if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
++          consume_hold_ = !consume;
++          paint_result = PaintAndPresent(false);
++          consume_hold_ = false;
++          painted = true;
++          if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
++            RequestPaintOrConnectionRecoveryViaWindow(true);
++          }
++        }
++      } else if (paint_mode_ == PaintMode::kUIThreadOnRequest && consume) {
++        RequestPaintOrConnectionRecoveryViaWindow(true);
++      }
++    }
++    if (host_gpu_loss_callback_) {
++      if (paint_result == PaintResult::kGpuLostResponsible) {
++        host_gpu_loss_callback_(true, false);
++      } else if (paint_result == PaintResult::kGpuLostExternally) {
++        host_gpu_loss_callback_(false, false);
++      }
++    }
++    if (consume) {
++      consumed = published;
++      shown_refreshes = 1;
++    } else {
++      ++shown_refreshes;
++    }
++    // Without a present (UI thread painting, or disconnected), there is no
++    // display refresh to wait on: go back to waiting for frames.
++    streaming = painted && (paint_result == PaintResult::kPresented ||
++                            paint_result == PaintResult::kPresentedSuboptimal);
++  }
++}
++
+ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+     uint32_t& mailbox_index_or_max_if_inactive_out, GuestOutputProperties* properties_out,
+     GuestOutputPaintConfig* paint_config_out) {
+@@ -824,10 +937,12 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+   // consumer though, the consumer mutex performs memory access ordering).
+   uint32_t old_acquired_and_ready =
+       guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
+-  // Desired acquired = current ready.
++  // Desired acquired = current ready, or, while the frame pacing thread
++  // presents the current frame again, the current acquired image.
+   // Desired ready = current ready (changed only by the producer).
+   uint32_t desired_acquired_and_ready =
+-      (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
++      consume_hold_ ? old_acquired_and_ready
++                    : (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
+   // Either the same image as during the last consumption, or a new one, is
+   // satisfying. However, if it's new, using memory_order_acq_rel to acquire the
+   // new ready image (to make it acquired) and to release the old acquired image
+@@ -837,7 +952,8 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+              old_acquired_and_ready, desired_acquired_and_ready, std::memory_order_acq_rel,
+              std::memory_order_relaxed)) {
+     desired_acquired_and_ready =
+-        (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
++        consume_hold_ ? old_acquired_and_ready
++                      : (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
+   }
+   uint32_t mailbox_index = desired_acquired_and_ready & 3;
+   // Give the current acquired image to the caller, or UINT32_MAX if it's
+diff --git a/src/ui/renderdoc_api.cpp b/src/ui/renderdoc_api.cpp
+index e1a5287..2a24b2b 100644
+--- a/src/ui/renderdoc_api.cpp
++++ b/src/ui/renderdoc_api.cpp
+@@ -16,7 +16,7 @@ namespace rex {
+ namespace ui {
+ 
+ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
+   // The vendored RenderDoc app API header doesn't expose a macOS path.
+   // Keep RenderDoc optional and simply report "not connected" on this platform.
+   return nullptr;
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 9ff54e8..92533d9 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ /**
+  * @file        ui/rex_app.cpp
+  * @brief       ReXApp implementation - compiled as part of the consumer executable
+@@ -100,6 +101,9 @@ bool ReXApp::OnInitialize() {
+ 
+   if (!ConstructRuntime(*paths))
+     return false;
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto init] LaunchModule();\n"); fflush(stderr);
++#endif
+   LaunchModule();
+   return true;
+ }
+@@ -232,17 +236,29 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     runtime_->set_imgui_drawer(imgui_drawer_.get());
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto init] auto status = runtime_->Setup(ppc_info_, std::move(config_));\n"); fflush(stderr);
++#endif
+   auto status = runtime_->Setup(ppc_info_, std::move(config_));
+   if (XFAILED(status)) {
+     REXLOG_ERROR("Runtime setup failed: {:08X}", status);
+     return false;
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto init] attaching input\n"); fflush(stderr);
++#endif
+   if (window_ && runtime_->input_system()) {
+     static_cast<rex::input::InputSystem*>(runtime_->input_system())->AttachWindow(window_.get());
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto init] if (ppc_info_.register_modules) {\n"); fflush(stderr);
++#endif
+   if (ppc_info_.register_modules) {
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto init] ppc_info_.register_modules(runtime_->kernel_state());\n"); fflush(stderr);
++#endif
+     ppc_info_.register_modules(runtime_->kernel_state());
+   }
+ 
+@@ -281,6 +297,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     }
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto init] status = runtime_->LoadXexImage(xex_image);\n"); fflush(stderr);
++#endif
+   status = runtime_->LoadXexImage(xex_image);
+   if (XFAILED(status)) {
+     auto msg = fmt::format("Failed to load XEX ({}): {:08X}", xex_image, status);
+@@ -289,6 +308,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     return false;
+   }
+ 
++#if REX_PLATFORM_PS5
++  fprintf(stderr, "[Naruto init] OnPostLoadXexImage();\n"); fflush(stderr);
++#endif
+   OnPostLoadXexImage();
+ 
+   if (ppc_info_.rexcrt_heap) {
+@@ -492,8 +514,14 @@ void ReXApp::LaunchModule() {
+       }
+     }
+ 
++#if REX_PLATFORM_PS5
++    fprintf(stderr, "[Naruto init] shader storage returned; resuming guest\n"); fflush(stderr);
++#endif
+     OnPostLaunchModule(main_thread.get());
+-    main_thread->Resume();
++    const auto resume_status = main_thread->Resume();
++#if REX_PLATFORM_PS5
++    fprintf(stderr, "[Naruto init] guest resume result %08x\n", resume_status); fflush(stderr);
++#endif
+ 
+     module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
+       main_thread->Wait(0, 0, 0, nullptr);
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 914b311..687118f 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -21,7 +21,10 @@
+ #include <rex/ui/vulkan/instance.h>
+ #include <rex/ui/vulkan/presenter.h>
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_PS5
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(
++    VkInstance instance, const char* name);
++#elif REX_PLATFORM_MAC
+ #include "vulkan_moltenvk.h"
+ #endif
+ 
+@@ -45,7 +48,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+ 
+   bool functions_loaded = true;
+   bool loader_loaded = false;
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_PS5
++  loader_loaded = true;
++  ifn.vkGetInstanceProcAddr = &vk_icdGetInstanceProcAddr;
++#elif REX_PLATFORM_MAC
+   const MacOSVulkanRuntimePaths macos_runtime_paths = DetectMacOSVulkanRuntimePaths();
+   ConfigureMacOSVulkanEnvironment(macos_runtime_paths);
+ 
+@@ -84,8 +90,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+ 
+ #define XE_VULKAN_LOAD_LOADER_FUNCTION(name) \
+   functions_loaded &= (ifn.name = vulkan_instance->loader_.GetSymbol<PFN_##name>(#name)) != nullptr;
++#if !REX_PLATFORM_PS5
+   XE_VULKAN_LOAD_LOADER_FUNCTION(vkGetInstanceProcAddr);
+   XE_VULKAN_LOAD_LOADER_FUNCTION(vkDestroyInstance);
++#endif
+ #undef XE_VULKAN_LOAD_LOADER_FUNCTION
+   if (!functions_loaded) {
+     REXLOG_ERROR("Failed to get Vulkan loader function pointers");
+@@ -140,6 +148,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   if (with_surface) {
+     // #1.
+     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
++    // #3. PS5 presentation uses a native direct-display plane.
++#if REX_PLATFORM_PS5
++    requested_extensions.emplace("VK_KHR_display", &vulkan_instance->extensions_.ext_KHR_display);
++#endif
+ #ifdef VK_USE_PLATFORM_XCB_KHR
+     // #6.
+     requested_extensions.emplace("VK_KHR_xcb_surface",
+@@ -440,6 +452,9 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+ #endif
+   if (vulkan_instance->extensions_.ext_KHR_surface) {
+ #include <rex/ui/vulkan/functions/instance_khr_surface.inc>
++  }
++  if (vulkan_instance->extensions_.ext_KHR_display) {
++#include <rex/ui/vulkan/functions/instance_khr_display.inc>
+   }
+   if (vulkan_instance->extensions_.ext_EXT_debug_utils) {
+ #include <rex/ui/vulkan/functions/instance_ext_debug_utils.inc>
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..db5f46f 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -45,6 +45,9 @@
+ #if REX_PLATFORM_MAC
+ #include <rex/ui/surface_mac.h>
+ #endif
++#if REX_PLATFORM_PS5
++#include <rex/ui/surface_ps5.h>
++#endif
+ 
+ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
+                     "Clear render pass during presentation");
+@@ -190,6 +193,8 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
+ }
+ 
+ VulkanPresenter::~VulkanPresenter() {
++  ShutdownFramePacing();
++
+   // Destroy the swapchain after its images are not used for drawing anymore.
+   // This is a confusing part in Vulkan, as vkQueuePresentKHR doesn't signal a
+   // fence clearly indicating when it's safe to destroy a swapchain, so we
+@@ -423,6 +428,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
+     return 0;
+   }
+   Surface::TypeFlags type_flags = 0;
++#if REX_PLATFORM_PS5
++  if (instance_extensions.ext_KHR_display) {
++    type_flags |= Surface::kTypeFlag_PS5Display;
++  }
++#endif
+ #if REX_PLATFORM_ANDROID
+   if (instance_extensions.ext_KHR_android_surface) {
+     type_flags |= Surface::kTypeFlag_AndroidNativeWindow;
+@@ -796,6 +806,74 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
+     }
+     VkResult vulkan_surface_create_result = VK_ERROR_UNKNOWN;
+     switch (surface_type) {
++#if REX_PLATFORM_PS5
++      case Surface::kTypeIndex_PS5Display: {
++        const VkPhysicalDevice physical_device = vulkan_device_->physical_device();
++        uint32_t display_count = 0;
++        vulkan_surface_create_result = ifn.vkGetPhysicalDeviceDisplayPropertiesKHR(
++            physical_device, &display_count, nullptr);
++        if (vulkan_surface_create_result != VK_SUCCESS || !display_count) break;
++        std::vector<VkDisplayPropertiesKHR> displays(display_count);
++        vulkan_surface_create_result = ifn.vkGetPhysicalDeviceDisplayPropertiesKHR(
++            physical_device, &display_count, displays.data());
++        if (vulkan_surface_create_result != VK_SUCCESS) break;
++
++        uint32_t mode_count = 0;
++        vulkan_surface_create_result = ifn.vkGetDisplayModePropertiesKHR(
++            physical_device, displays.front().display, &mode_count, nullptr);
++        if (vulkan_surface_create_result != VK_SUCCESS || !mode_count) break;
++        std::vector<VkDisplayModePropertiesKHR> modes(mode_count);
++        vulkan_surface_create_result = ifn.vkGetDisplayModePropertiesKHR(
++            physical_device, displays.front().display, &mode_count, modes.data());
++        if (vulkan_surface_create_result != VK_SUCCESS) break;
++        const VkDisplayModePropertiesKHR* mode = &modes.front();
++        for (const auto& candidate : modes) {
++          if (candidate.parameters.visibleRegion.width == new_surface_width &&
++              candidate.parameters.visibleRegion.height == new_surface_height) {
++            mode = &candidate;
++            break;
++          }
++        }
++
++        uint32_t plane_count = 0;
++        vulkan_surface_create_result = ifn.vkGetPhysicalDeviceDisplayPlanePropertiesKHR(
++            physical_device, &plane_count, nullptr);
++        if (vulkan_surface_create_result != VK_SUCCESS || !plane_count) break;
++        std::vector<VkDisplayPlanePropertiesKHR> planes(plane_count);
++        vulkan_surface_create_result = ifn.vkGetPhysicalDeviceDisplayPlanePropertiesKHR(
++            physical_device, &plane_count, planes.data());
++        if (vulkan_surface_create_result != VK_SUCCESS) break;
++        vulkan_surface_create_result = VK_ERROR_INITIALIZATION_FAILED;
++        for (uint32_t plane_index = 0; plane_index < plane_count; ++plane_index) {
++          uint32_t supported_count = 0;
++          if (ifn.vkGetDisplayPlaneSupportedDisplaysKHR(
++                  physical_device, plane_index, &supported_count, nullptr) != VK_SUCCESS ||
++              !supported_count) continue;
++          std::vector<VkDisplayKHR> supported(supported_count);
++          if (ifn.vkGetDisplayPlaneSupportedDisplaysKHR(
++                  physical_device, plane_index, &supported_count, supported.data()) != VK_SUCCESS ||
++              std::find(supported.begin(), supported.end(), displays.front().display) == supported.end())
++            continue;
++          VkDisplayPlaneCapabilitiesKHR caps{};
++          if (ifn.vkGetDisplayPlaneCapabilitiesKHR(physical_device, mode->displayMode,
++                                                    plane_index, &caps) != VK_SUCCESS ||
++              !(caps.supportedAlpha & VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR))
++            continue;
++          VkDisplaySurfaceCreateInfoKHR create_info{
++              VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR};
++          create_info.displayMode = mode->displayMode;
++          create_info.planeIndex = plane_index;
++          create_info.planeStackIndex = planes[plane_index].currentStackIndex;
++          create_info.transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++          create_info.globalAlpha = 1.0f;
++          create_info.alphaMode = VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR;
++          create_info.imageExtent = mode->parameters.visibleRegion;
++          vulkan_surface_create_result = ifn.vkCreateDisplayPlaneSurfaceKHR(
++              instance, &create_info, nullptr, &paint_context_.vulkan_surface);
++          if (vulkan_surface_create_result == VK_SUCCESS) break;
++        }
++      } break;
++#endif
+ #if REX_PLATFORM_ANDROID
+       case Surface::kTypeIndex_AndroidNativeWindow: {
+         auto& android_native_window_surface =
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 6782cce..409dc99 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -27,7 +27,9 @@
+ #include <rex/ui/flags.h>
+ #include <rex/ui/sdl_virtual_key.h>
+ 
+-#if REX_PLATFORM_WIN32
++#if REX_PLATFORM_PS5
++#include <rex/ui/surface_ps5.h>
++#elif REX_PLATFORM_WIN32
+ #include <rex/ui/surface_win.h>
+ #elif REX_PLATFORM_MAC
+ #include <CoreFoundation/CoreFoundation.h>
+@@ -175,7 +177,9 @@ void WindowSDL::DestroySDLWindow() {
+ }
+ 
+ void* WindowSDL::GetNativeWindowHandle() const {
+-#if REX_PLATFORM_WIN32
++#if REX_PLATFORM_PS5
++  return nullptr;
++#elif REX_PLATFORM_WIN32
+   if (!sdl_window_) {
+     return nullptr;
+   }
+@@ -422,6 +426,12 @@ void WindowSDL::FocusImpl() {
+ }
+ 
+ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed_types) {
++#if REX_PLATFORM_PS5
++  if (allowed_types & Surface::kTypeFlag_PS5Display) {
++    return std::make_unique<PS5DisplaySurface>();
++  }
++  return nullptr;
++#else
+   if (!sdl_window_) {
+     return nullptr;
+   }
+@@ -469,6 +479,7 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+   }
+ #endif
+   return nullptr;
++#endif  // REX_PLATFORM_PS5
+ }
+ 
+ void WindowSDL::RequestPaintImpl() {
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..9b5cfba 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -25,6 +25,12 @@
+ 
+ namespace rex::ui {
+ 
++#if REX_PLATFORM_PS5
++// Supplied by the title's native controller bridge. Keeping this weak lets the
++// runtime remain independently linkable for build-time verification tools.
++extern "C" void ps5_input_poll(void) __attribute__((weak));
++#endif
++
+ SDLWindowedAppContext::~SDLWindowedAppContext() {
+   if (event_watch_registered_) {
+     SDL_RemoveEventWatch(WatchEvent, this);
+@@ -86,11 +92,30 @@ void SDLWindowedAppContext::PlatformQuitFromUIThread() {
+ 
+ int SDLWindowedAppContext::RunMainMessageLoop() {
+   while (!HasQuitFromUIThread()) {
++#if REX_PLATFORM_PS5
++    if (ps5_input_poll) {
++      ps5_input_poll();
++    }
++#endif
+     SDL_Event event;
++#if REX_PLATFORM_PS5
++    // Native pad events are produced by polling rather than SDL's video event
++    // source, so wake regularly even before the controller's first event.
++    SDL_ClearError();
++    if (!SDL_WaitEventTimeout(&event, 8)) {
++      const char* error = SDL_GetError();
++      if (error && error[0]) {
++        REXLOG_ERROR("SDL_WaitEventTimeout failed: {}", error);
++        return EXIT_FAILURE;
++      }
++      continue;
++    }
++#else
+     if (!SDL_WaitEvent(&event)) {
+       REXLOG_ERROR("SDL_WaitEvent failed: {}", SDL_GetError());
+       return EXIT_FAILURE;
+     }
++#endif
+     ProcessEvent(event);
+   }
+   return EXIT_SUCCESS;
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..31be736 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -177,6 +177,9 @@ set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+ set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+ set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+ set(SPDLOG_INSTALL ON CACHE BOOL "" FORCE)
++if(PS5)
++    set(SPDLOG_FWRITE_UNLOCKED OFF CACHE BOOL "" FORCE)
++endif()
+ add_subdirectory(spdlog)
+ target_compile_options(spdlog PRIVATE -w)
+ 
+@@ -244,6 +247,19 @@ target_compile_options(imgui PRIVATE -w)
+ #=============================================================================
+ # SDL3 - Cross-platform media layer
+ #=============================================================================
++if(PS5)
++set(REXGLUE_PS5_SDL_SOURCE "" CACHE PATH "PS5-enabled SDL3 source tree")
++set(REXGLUE_PS5_SDL_LIBRARY "" CACHE FILEPATH "Cross-built PS5 SDL3 archive")
++if(NOT EXISTS "${REXGLUE_PS5_SDL_SOURCE}/include/SDL3/SDL.h" OR
++   NOT EXISTS "${REXGLUE_PS5_SDL_LIBRARY}")
++    message(FATAL_ERROR "PS5 requires REXGLUE_PS5_SDL_SOURCE and REXGLUE_PS5_SDL_LIBRARY")
++endif()
++add_library(rexglue_ps5_sdl STATIC IMPORTED GLOBAL)
++set_target_properties(rexglue_ps5_sdl PROPERTIES
++    IMPORTED_LOCATION "${REXGLUE_PS5_SDL_LIBRARY}"
++    INTERFACE_INCLUDE_DIRECTORIES "${REXGLUE_PS5_SDL_SOURCE}/include")
++add_library(SDL3::SDL3 ALIAS rexglue_ps5_sdl)
++else()
+ set(SDL_INSTALL ON CACHE BOOL "" FORCE)
+ set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+ set(SDL_STATIC ON CACHE BOOL "" FORCE)
+@@ -302,6 +318,7 @@ if(UNIX AND NOT APPLE)
+ endif()
+ 
+ add_subdirectory(sdl3)
++endif()
+ 
+ #=============================================================================
+ # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)
+@@ -407,6 +424,19 @@ endif()
+ # FFmpeg - Audio/video codec library (for XMA decoding)
+ # Only builds libavutil and libavcodec needed for WMA Pro decoding
+ #=============================================================================
++if(PS5)
++set(REXGLUE_PS5_FFMPEG_PREFIX "" CACHE PATH "Cross-built PS5 FFmpeg install prefix")
++foreach(_ffmpeg_component avutil avcodec)
++    if(NOT EXISTS "${REXGLUE_PS5_FFMPEG_PREFIX}/lib/lib${_ffmpeg_component}.a")
++        message(FATAL_ERROR "Missing PS5 FFmpeg archive: ${REXGLUE_PS5_FFMPEG_PREFIX}/lib/lib${_ffmpeg_component}.a")
++    endif()
++    add_library(lib${_ffmpeg_component} STATIC IMPORTED GLOBAL)
++    set_target_properties(lib${_ffmpeg_component} PROPERTIES
++        IMPORTED_LOCATION "${REXGLUE_PS5_FFMPEG_PREFIX}/lib/lib${_ffmpeg_component}.a"
++        INTERFACE_INCLUDE_DIRECTORIES "${REXGLUE_PS5_FFMPEG_PREFIX}/include")
++endforeach()
++target_link_libraries(libavcodec INTERFACE libavutil)
++else()
+ 
+ set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
+ 
+@@ -702,3 +732,4 @@ set_target_properties(libavutil libavcodec PROPERTIES
+     C_VISIBILITY_PRESET hidden
+     VISIBILITY_INLINES_HIDDEN ON
+     FOLDER "FFmpeg")
++endif()
+diff --git a/thirdparty/crypto/sha256.cpp b/thirdparty/crypto/sha256.cpp
+index e96b4da..c6d42d7 100644
+--- a/thirdparty/crypto/sha256.cpp
++++ b/thirdparty/crypto/sha256.cpp
+@@ -9,7 +9,7 @@
+ 
+ // big endian architectures need #define __BYTE_ORDER __BIG_ENDIAN
+ #ifndef _MSC_VER
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(__PROSPERO__)
+ #if !defined(__BYTE_ORDER) && defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__)
+ #define __BYTE_ORDER __BYTE_ORDER__
+ #define __BIG_ENDIAN __ORDER_BIG_ENDIAN__
+@@ -579,4 +579,4 @@ std::string SHA256::operator()(const std::string& text) {
+   return getHash();
+ }
+ 
+-}  // namespace sha256
+\ No newline at end of file
++}  // namespace sha256

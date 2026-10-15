@@ -477,3 +477,61 @@ The user started the next same-race comparison at an observed elapsed
 cutoff. At this observation, the latest health record reports one dropped
 startup event. Exclude earlier boot/title samples and do not replace or
 restart this build during the race.
+
+### Paused: measured dispatch hotspots
+
+Work is paused at the user's request. Do not restart, redeploy or begin the
+next optimization until the user resumes. The installed dispatch-stage
+diagnostic build and running game were left unchanged. Its bounded capture
+ends automatically after ten minutes or 64 MiB; download it before any future
+diagnostic launch replaces it.
+
+The saved race-only evidence is
+`build/console/dispatch-race-live-trace.bin` and
+`build/console/dispatch-race-live-report.json`. Exclude samples before the
+113.893-second boundary in `build/console/dispatch-race-start-marker.json`.
+The snapshot covers 93.814 seconds of race data, contains 79,291 race-only
+events and zero repeated-image completions. Its cumulative health counter is
+one dropped event, unchanged from the startup boundary.
+
+Command frame 16694 takes 102.637 ms and precedes a 100.110 ms distinct-image
+gap. Its exclusive wall-time breakdown is:
+
+| Category | Time |
+| --- | ---: |
+| Primitive processing | 29.776 ms |
+| Vertex-buffer preparation | 23.854 ms |
+| Empty command ring | 16.659 ms |
+| Resolves/readbacks | 8.299 ms |
+| Textures | 7.675 ms |
+| Residual dispatch | 7.320 ms |
+| Swap work and submission | 2.822 ms |
+| Bindings | 1.783 ms |
+| Constants | 1.262 ms |
+| Render targets | 0.951 ms |
+| Samplers | 0.816 ms |
+| Pipelines | 0.620 ms |
+| Shader translation | 0.488 ms |
+| Register waits | 0.295 ms |
+| Blocking fence checks | 0.012 ms |
+| Other worker time | 0.004 ms |
+
+The command thread consumes 49.819 ms of CPU time in that interval, exceeding
+the 33.3 ms budget for 30 FPS. This is not solely presentation delay or a
+sleeping worker. CPU time is measured for the whole frame, not each category.
+Other long frames repeatedly show 21–32 ms of primitive processing and
+11–27 ms of vertex-buffer preparation. Texture and resolve costs vary.
+
+**Next investigation:** inspect primitive conversion and vertex-buffer
+residency/upload paths, including shared memory preparation and repeated
+work. Identify the actual repeated or unnecessary operation before changing
+it. Do not infer a particular implementation fault from stage totals alone.
+No optimization for these hotspots has been applied. Compare any targeted
+candidate against the same race with graphics, saves, readbacks and caches
+unchanged. The existing diagnostics can perturb timing; verify an eventual
+performance improvement with tracing disabled as well.
+
+Source checkpoint before this note: `52c494d` on `main`. Matching console
+symbols are `build/console/dispatch-stage-symbols.elf`. The preceding
+executable is retained on the console as
+`eboot.bin.before-dispatch-stage-diagnostics-20261015-205323`.

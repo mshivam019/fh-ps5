@@ -90,8 +90,15 @@ features, readbacks, saves, or caches are disabled.
 - Linux 180-second boot-to-drive smoke renders the world and car. Guest p95 is
   34.9 ms versus 35.0 ms in the control. Presentation results vary substantially
   between runs; they do not establish a whole-game stutter improvement.
-- PS5 runtime and app build successfully. Console race/free-roam comparison is
-  required before claiming a frame-pacing improvement.
+- Console playtest: the user reports multiple stutters. The first 18 high-draw
+  windows average 27.9 FPS, versus 27.88 FPS across 66 baseline windows. Routes
+  and sample durations differ, so these are not a controlled A/B comparison.
+  The candidate still has 67–166 ms frame gaps with zero shader placeholders
+  in the recent windows and 0.7–0.8 ms of pipeline waits per five seconds.
+  Several affected windows also contain 150–360 ms of command starvation.
+  This change has not established a meaningful whole-game pacing improvement.
+  Next investigation: correlate individual frame gaps with guest command
+  delivery and streaming, rather than infer their cause from utilization.
 
 Rejected experiments: fence-poll sleeping lowered CPU utilization without
 improving pacing. Unchanged shader-constant comparisons provided no throughput

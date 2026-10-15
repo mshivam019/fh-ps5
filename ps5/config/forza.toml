@@ -4,6 +4,13 @@ log_level = "info"
 log_noisy = false
 log_flush_interval = 1
 
+# New shaders compile in the background: draws that need them are skipped for
+# the few frames they take, instead of the frame waiting for the compiler and
+# then being dropped. Every compiled pipeline is stored and rebuilt at the next
+# start, so a place looks complete from the second visit on.
+vulkan_async_pipeline_wait_at_submission = false
+vulkan_async_skip_incomplete_frames = false
+
 # The game reads back car thumbnails it renders for the garage and profile.
 # "some" copies a resolve back the first time it is seen, which is what the
 # thumbnails need, and costs nothing in a race (upstream default).

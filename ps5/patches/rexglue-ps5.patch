@@ -77,6 +77,47 @@ index d876846..0dee191 100644
  // Apple libc++ does not expose clock_time_conversion or clock_cast.
  template <class, class>
  struct clock_time_conversion {};
+diff --git a/include/rex/diagnostic_trace.h b/include/rex/diagnostic_trace.h
+new file mode 100644
+index 0000000..1548471
+--- /dev/null
++++ b/include/rex/diagnostic_trace.h
+@@ -0,0 +1,35 @@
++#pragma once
++#include <rex/platform.h>
++#include <cstdint>
++#include <chrono>
++#if REX_PLATFORM_PS5
++extern "C" bool rex_ps5_trace_enabled();
++extern "C" void rex_ps5_trace(uint32_t stage, uint64_t id, uint64_t argument,
++                               uint64_t duration_ns, const char* path);
++namespace rex::diagnostic {
++inline uint64_t Now() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++      std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++inline void Event(uint32_t stage, uint64_t id = 0, uint64_t argument = 0) {
++  if (rex_ps5_trace_enabled()) rex_ps5_trace(stage, id, argument, 0, nullptr);
++}
++class SlowScope {
++ public:
++  SlowScope(uint32_t stage, uint64_t id = 0, uint64_t argument = 0,
++            const char* path = nullptr, bool active = true)
++      : stage_(stage), id_(id), argument_(argument), path_(path),
++        begin_(active && rex_ps5_trace_enabled() ? Now() : 0) {}
++  ~SlowScope() {
++    if (!begin_) return;
++    const uint64_t duration = Now() - begin_;
++    if (duration >= 2000000) rex_ps5_trace(stage_, id_, argument_, duration, path_);
++  }
++ private:
++  uint32_t stage_;
++  uint64_t id_, argument_;
++  const char* path_;
++  uint64_t begin_;
++};
++}
++#endif
 diff --git a/include/rex/filesystem/case_path.h b/include/rex/filesystem/case_path.h
 new file mode 100644
 index 0000000..1624b1b
@@ -1831,6 +1872,29 @@ index 0e66b35..a3c1d0b 100644
    pthread_setname_np(std::string(name).c_str());
  #else
    pthread_setname_np(pthread_self(), std::string(name).c_str());
+diff --git a/src/filesystem/devices/host_path_file.cpp b/src/filesystem/devices/host_path_file.cpp
+index 4c57a18..5f2be0b 100644
+--- a/src/filesystem/devices/host_path_file.cpp
++++ b/src/filesystem/devices/host_path_file.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/filesystem/devices/host_path_entry.h>
+ #include <rex/filesystem/devices/host_path_file.h>
++#include <rex/diagnostic_trace.h>
+ 
+ namespace rex::filesystem {
+ 
+@@ -30,6 +31,10 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
+     return X_STATUS_ACCESS_DENIED;
+   }
+ 
++#if REX_PLATFORM_PS5
++  rex::diagnostic::SlowScope read_trace(10, byte_offset, buffer.size(),
++                                       entry()->absolute_path().c_str());
++#endif
+   if (file_handle_->Read(byte_offset, buffer.data(), buffer.size(), out_bytes_read)) {
+     return X_STATUS_SUCCESS;
+   } else {
 diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
 index da7ae1a..f865d2c 100644
 --- a/src/graphics/CMakeLists.txt
@@ -1849,7 +1913,7 @@ index da7ae1a..f865d2c 100644
  
  set_target_properties(rexgpu-xenos PROPERTIES
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 7892600..997b72a 100644
+index 7892600..58ea373 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,6 +10,7 @@
@@ -1860,7 +1924,15 @@ index 7892600..997b72a 100644
  #include <cinttypes>
  #include <cmath>
  #include <cstring>
-@@ -177,6 +178,18 @@ void CommandProcessor::ClearCaches() {}
+@@ -19,6 +20,7 @@
+ 
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
++#include <rex/diagnostic_trace.h>
+ #include <rex/perf/counter.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/graphics/command_processor.h>
+@@ -177,6 +179,18 @@ void CommandProcessor::ClearCaches() {}
  
  void CommandProcessor::InvalidateGpuMemory() {}
  
@@ -1879,7 +1951,7 @@ index 7892600..997b72a 100644
  ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
      bool legacy_readback_resolve_enabled) const {
    ReadbackResolveMode shared_mode = ParseReadbackResolveMode(REXCVAR_GET(readback_resolve));
-@@ -205,6 +218,12 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
+@@ -205,6 +219,12 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
    CallInThread([this, swap_post_effect]() { swap_post_effect_actual_ = swap_post_effect; });
  }
  
@@ -1892,7 +1964,7 @@ index 7892600..997b72a 100644
  void CommandProcessor::WorkerThreadMain() {
    if (!SetupContext()) {
      rex::FatalError("Unable to setup command processor internal state");
-@@ -225,6 +244,9 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -225,6 +245,9 @@ void CommandProcessor::WorkerThreadMain() {
        // We spin here waiting for new ones, as the overhead of waiting on our
        // event is too high.
        PrepareForWait();
@@ -1902,7 +1974,7 @@ index 7892600..997b72a 100644
        uint32_t loop_count = 0;
        do {
          // If we spin around too much, revert to a "low-power" state.
-@@ -240,6 +262,11 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -240,6 +263,18 @@ void CommandProcessor::WorkerThreadMain() {
        } while (worker_running_ && pending_fns_.empty() &&
                 (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
        ReturnFromWait();
@@ -1910,10 +1982,28 @@ index 7892600..997b72a 100644
 +      g_ps5_command_stall_ms +=
 +          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stall_begin)
 +              .count();
++#if REX_PLATFORM_PS5
++      const auto idle_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++          std::chrono::steady_clock::now() - stall_begin).count();
++      if (idle_ns >= 2000000 && rex_ps5_trace_enabled()) {
++        rex_ps5_trace(7, counter_, 0, uint64_t(idle_ns), nullptr);
++      }
++#endif
 +#endif
        if (!worker_running_ || !pending_fns_.empty()) {
          continue;
        }
+@@ -1021,6 +1056,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+   uint32_t ref = reader->ReadAndSwap<uint32_t>();
+   uint32_t mask = reader->ReadAndSwap<uint32_t>();
+   uint32_t wait = reader->ReadAndSwap<uint32_t>();
++  #if REX_PLATFORM_PS5
++  rex::diagnostic::SlowScope register_wait_trace(
++      16, poll_reg_addr, (uint64_t(wait_info) << 32) | wait);
++  #endif
+ 
+   bool is_memory = (wait_info & 0x10) != 0;
+ 
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
 index 65c3613..7bacfe1 100644
 --- a/src/graphics/graphics_system.cpp
@@ -2373,7 +2463,7 @@ index 25fca71..7a2c4d3 100644
  
    return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 24abe85..c858a69 100644
+index 24abe85..5e3a6be 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -1,3 +1,4 @@
@@ -2390,7 +2480,15 @@ index 24abe85..c858a69 100644
  #include <array>
  #include <cstdint>
  #include <cstring>
-@@ -82,10 +85,55 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+@@ -20,6 +23,7 @@
+ #include <string>
+ #include <string_view>
+ #include <tuple>
++#include <rex/diagnostic_trace.h>
+ #include <utility>
+ #include <vector>
+ 
+@@ -82,10 +86,55 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                      "device (falls back to render passes otherwise)")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -2446,7 +2544,7 @@ index 24abe85..c858a69 100644
  // glslang default built-in resource limits.
  constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
      /* .maxLights = */ 32,
-@@ -510,9 +558,15 @@ void main() {
+@@ -510,9 +559,15 @@ void main() {
  
  bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
                                  std::vector<uint32_t>& spirv_out, std::string& error_out) {
@@ -2462,7 +2560,7 @@ index 24abe85..c858a69 100644
    const char* source_c_str = source.data();
    glslang::TShader shader(stage);
    shader.setStrings(&source_c_str, 1);
-@@ -520,6 +574,9 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
+@@ -520,6 +575,9 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
    shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
    shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
  
@@ -2472,7 +2570,7 @@ index 24abe85..c858a69 100644
    EShMessages messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
    if (!shader.parse(&kGlslangDefaultTBuiltInResource, 450, false, messages)) {
      error_out = "glslang shader parse failed";
-@@ -531,6 +588,9 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
+@@ -531,6 +589,9 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
      return false;
    }
  
@@ -2482,7 +2580,7 @@ index 24abe85..c858a69 100644
    glslang::TProgram program;
    program.addShader(&shader);
    if (!program.link(messages)) {
-@@ -549,6 +609,9 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
+@@ -549,6 +610,9 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
      return false;
    }
  
@@ -2492,7 +2590,7 @@ index 24abe85..c858a69 100644
    glslang::SpvOptions spv_options = {};
    spv_options.disableOptimizer = true;
    spv_options.optimizeSize = false;
-@@ -580,6 +643,10 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuf
+@@ -580,6 +644,10 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuf
      VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
      SpirvShaderTranslator::kConstantBufferCount* kLinkedTypeDescriptorPoolSetCount};
  
@@ -2503,7 +2601,7 @@ index 24abe85..c858a69 100644
  const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kLinkedTypeDescriptorPoolSetCount};
  
-@@ -597,6 +664,10 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
+@@ -597,6 +665,10 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
            static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
                ->vulkan_device(),
            &kDescriptorPoolSizeUniformBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
@@ -2514,7 +2612,7 @@ index 24abe85..c858a69 100644
        transient_descriptor_allocator_storage_buffer_(
            static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
                ->vulkan_device(),
-@@ -931,7 +1002,7 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -931,7 +1003,7 @@ bool VulkanCommandProcessor::SetupContext() {
    for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
      VkDescriptorSetLayoutBinding& constants_binding = descriptor_set_layout_bindings_constants[i];
      constants_binding.binding = i;
@@ -2523,7 +2621,7 @@ index 24abe85..c858a69 100644
      constants_binding.descriptorCount = 1;
      constants_binding.pImmutableSamplers = nullptr;
    }
-@@ -1133,6 +1204,9 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -1133,6 +1205,9 @@ bool VulkanCommandProcessor::SetupContext() {
      return false;
    }
  
@@ -2533,7 +2631,7 @@ index 24abe85..c858a69 100644
    // Shared memory and EDRAM common bindings.
    VkDescriptorPoolSize descriptor_pool_sizes[1];
    descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-@@ -1208,6 +1282,9 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -1208,6 +1283,9 @@ bool VulkanCommandProcessor::SetupContext() {
    dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock),
                               write_descriptor_sets, 0, nullptr);
  
@@ -2543,7 +2641,7 @@ index 24abe85..c858a69 100644
    // Swap objects.
  
    // Gamma ramp, either device-local and host-visible at once, or separate
-@@ -1665,6 +1742,9 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -1665,6 +1743,9 @@ bool VulkanCommandProcessor::SetupContext() {
      return false;
    }
  
@@ -2553,7 +2651,7 @@ index 24abe85..c858a69 100644
    // Gamma ramp application pipeline.
    // Using a graphics pipeline, not a compute one, because storage image support
    // is optional for VK_FORMAT_A2B10G10R10_UNORM_PACK32.
-@@ -1877,6 +1957,9 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -1877,6 +1958,9 @@ bool VulkanCommandProcessor::SetupContext() {
      return false;
    }
  
@@ -2563,7 +2661,7 @@ index 24abe85..c858a69 100644
    // Gamma ramp application compute pipelines.
    swap_apply_gamma_compute_256_entry_table_pipeline_ = ui::vulkan::util::CreateComputePipeline(
        vulkan_device, swap_apply_gamma_compute_pipeline_layout_, shaders::apply_gamma_table_cs,
-@@ -1940,6 +2023,9 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -1940,6 +2024,9 @@ bool VulkanCommandProcessor::SetupContext() {
                                      "swap gamma PWL FXAA-luma compute red/blue fallback");
    }
  
@@ -2573,7 +2671,7 @@ index 24abe85..c858a69 100644
    // FXAA compute pipelines, compiled to SPIR-V at runtime.
    std::vector<uint32_t> swap_fxaa_spirv;
    std::string swap_fxaa_compile_error;
-@@ -1999,6 +2085,9 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -1999,6 +2086,9 @@ bool VulkanCommandProcessor::SetupContext() {
  
    occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
  
@@ -2583,7 +2681,7 @@ index 24abe85..c858a69 100644
    // Just not to expose uninitialized memory.
    std::memset(&system_constants_, 0, sizeof(system_constants_));
  
-@@ -2397,6 +2486,21 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
+@@ -2397,6 +2487,21 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
    if (!num_registers) {
      return;
    }
@@ -2605,7 +2703,18 @@ index 24abe85..c858a69 100644
    uint32_t end_index = start_index + num_registers - 1;
  
    auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,
-@@ -2582,6 +2686,45 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2561,6 +2666,10 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+ 
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
++#if REX_PLATFORM_PS5
++  rex::diagnostic::Event(1, counter_);
++  rex::diagnostic::SlowScope swap_trace(2, counter_);
++#endif
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+@@ -2582,6 +2691,45 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
    bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                              REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                              frame_used_async_placeholder_pipeline_;
@@ -2651,7 +2760,7 @@ index 24abe85..c858a69 100644
    if (skip_present_due_async_placeholder) {
      static bool skipped_incomplete_frame_logged = false;
      if (!skipped_incomplete_frame_logged) {
-@@ -3950,6 +4093,9 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+@@ -3950,6 +4098,9 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
  bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                         IndexBufferInfo* index_buffer_info,
                                         bool major_mode_explicit) {
@@ -2661,7 +2770,7 @@ index 24abe85..c858a69 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -4068,7 +4214,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4068,7 +4219,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      }
  
      // Process primitives.
@@ -2676,7 +2785,7 @@ index 24abe85..c858a69 100644
        return draw_fail("primitive_processing");
      }
      if (!primitive_processing_result.host_draw_vertex_count) {
-@@ -4195,12 +4347,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4195,12 +4352,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    uint32_t used_texture_mask =
        vertex_shader->GetUsedTextureMaskAfterTranslation() |
        (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
@@ -2701,7 +2810,7 @@ index 24abe85..c858a69 100644
      return draw_fail("render_target_update");
    }
  
-@@ -4209,11 +4371,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4209,11 +4376,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // textures.
    VkPipeline pipeline;
    void* pipeline_handle = nullptr;
@@ -2723,7 +2832,7 @@ index 24abe85..c858a69 100644
      return draw_fail("configure_pipeline");
    }
    bool pipeline_is_placeholder = false;
-@@ -4254,6 +4421,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4254,6 +4426,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          descriptor_sets_kept = std::min(
              descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
        }
@@ -2732,7 +2841,7 @@ index 24abe85..c858a69 100644
      } else {
        // No or unknown pipeline layout previously bound - all bindings are in an
        // indeterminate state.
-@@ -4285,6 +4454,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4285,6 +4459,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    // life. Or even disregard the viewport bounds range in the fragment shader
    // interlocks case completely - apply the viewport and the scissor offset
    // directly to pixel address and to things like ps_param_gen.
@@ -2743,7 +2852,7 @@ index 24abe85..c858a69 100644
    draw_util::GetHostViewportInfo(
        regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
        device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
-@@ -4294,6 +4467,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4294,6 +4472,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
  
    // Update dynamic graphics pipeline state.
    UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
@@ -2751,7 +2860,7 @@ index 24abe85..c858a69 100644
  
    auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
  
-@@ -4327,20 +4501,37 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4327,20 +4506,37 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    }
  
    // Update system constants before uploading them.
@@ -2794,7 +2903,7 @@ index 24abe85..c858a69 100644
      uint32_t j;
      while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
        vfetch_bits_remaining &= ~(uint32_t(1) << j);
-@@ -4386,6 +4577,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4386,6 +4582,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
      }
    }
@@ -2802,7 +2911,7 @@ index 24abe85..c858a69 100644
  
    // Synchronize the memory pages backing memory scatter export streams, and
    // calculate the range that includes the streams for the buffer barrier.
-@@ -4555,8 +4747,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4555,8 +4752,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
    }
  
@@ -2814,7 +2923,7 @@ index 24abe85..c858a69 100644
      uint32_t memexport_total_size = 0;
      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
        memexport_total_size += memexport_range.size_bytes;
-@@ -4780,7 +4973,7 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4780,7 +4978,7 @@ bool VulkanCommandProcessor::IssueCopy() {
    }
  
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
@@ -2823,7 +2932,7 @@ index 24abe85..c858a69 100644
      uint32_t written_address, written_length;
      return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                           written_address, written_length);
-@@ -4810,7 +5003,23 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -4810,7 +5008,23 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
  
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
@@ -2848,17 +2957,21 @@ index 24abe85..c858a69 100644
    }
  
    auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
-@@ -5334,6 +5543,9 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
+@@ -5334,6 +5548,13 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
  }
  
  void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
++#if REX_PLATFORM_PS5
++  rex::diagnostic::SlowScope fence_trace(8, await_submission, submission_completed_,
++                                        nullptr, await_submission != 0);
++#endif
 +#if REX_GPU_STAGE_STATS
 +  ScopedCpuStage cpu_stage(2);
 +#endif
    // Only report once, no need to retry a wait that won't succeed anyway.
    if (device_lost_) {
      return;
-@@ -5376,13 +5588,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5376,13 +5597,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
    }
    if (await_submission > submission_completed_) {
      // Await in a blocking way if requested.
@@ -2878,7 +2991,7 @@ index 24abe85..c858a69 100644
      if (wait_result == VK_SUCCESS) {
        fences_awaited += await_submission - submission_completed_;
      } else {
-@@ -5397,7 +5609,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -5397,7 +5618,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
    // that for simplicity.
    while (fences_awaited < fences_total) {
      VkResult fence_status =
@@ -2887,10 +3000,13 @@ index 24abe85..c858a69 100644
      if (fence_status != VK_SUCCESS) {
        if (fence_status == VK_ERROR_DEVICE_LOST) {
          device_lost_ = true;
-@@ -5641,6 +5853,12 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5641,6 +5862,15 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
  }
  
  bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
++#if REX_PLATFORM_PS5
++  rex::diagnostic::SlowScope submit_trace(9, GetCurrentSubmission(), is_swap, nullptr, is_swap);
++#endif
 +  // Never reuse descriptors across submission/resource-reclamation boundaries.
 +  for (auto& snapshot : texture_descriptor_snapshots_) snapshot.Invalidate();
 +  constant_descriptor_snapshot_.Invalidate();
@@ -2900,7 +3016,7 @@ index 24abe85..c858a69 100644
    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
-@@ -5885,6 +6103,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5885,6 +6115,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
    if (is_closing_frame) {
      if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
        shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
@@ -2909,7 +3025,7 @@ index 24abe85..c858a69 100644
      }
      frame_open_ = false;
      // Submission already closed now, so minus 1.
-@@ -5926,6 +6146,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5926,6 +6158,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
    return true;
  }
  
@@ -2917,7 +3033,7 @@ index 24abe85..c858a69 100644
  void VulkanCommandProcessor::ClearTransientDescriptorPools() {
    texture_transient_descriptor_sets_free_.clear();
    texture_transient_descriptor_sets_used_.clear();
-@@ -5940,6 +6161,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
+@@ -5940,6 +6173,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
    single_transient_descriptors_used_.clear();
    transient_descriptor_allocator_storage_buffer_.Reset();
    transient_descriptor_allocator_uniform_buffer_.Reset();
@@ -2925,7 +3041,7 @@ index 24abe85..c858a69 100644
  }
  
  void VulkanCommandProcessor::SplitPendingBarrier() {
-@@ -6797,6 +7019,23 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+@@ -6797,6 +7031,23 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
    }
  }
  
@@ -2949,7 +3065,7 @@ index 24abe85..c858a69 100644
  bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                              const VulkanShader* pixel_shader) {
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -6804,6 +7043,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6804,6 +7055,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
  
    const RegisterFile& regs = *register_file_;
@@ -2959,7 +3075,7 @@ index 24abe85..c858a69 100644
  
    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-@@ -6896,18 +7138,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6896,18 +7150,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
          return false;
        }
        buffer_info.range = VkDeviceSize(float_constants_size);
@@ -2980,7 +3096,7 @@ index 24abe85..c858a69 100644
        current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                                << SpirvShaderTranslator::kConstantBufferFloatVertex;
      }
-@@ -6925,18 +7157,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6925,18 +7169,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
          return false;
        }
        buffer_info.range = VkDeviceSize(float_constants_size);
@@ -3001,7 +3117,7 @@ index 24abe85..c858a69 100644
        current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                                << SpirvShaderTranslator::kConstantBufferFloatPixel;
      }
-@@ -6976,6 +7198,34 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6976,6 +7210,34 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
  
@@ -3036,7 +3152,7 @@ index 24abe85..c858a69 100644
    // Textures and samplers.
    const std::vector<VulkanShader::SamplerBinding>& samplers_vertex =
        vertex_shader->GetSamplerBindingsAfterTranslation();
-@@ -6997,10 +7247,36 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6997,10 +7259,36 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      sampler_count_pixel = 0;
      texture_count_pixel = 0;
    }
@@ -3077,7 +3193,7 @@ index 24abe85..c858a69 100644
  
    // Make sure new descriptor sets are bound to the command buffer.
  
-@@ -7062,6 +7338,30 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -7062,6 +7350,30 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
  
@@ -3108,7 +3224,7 @@ index 24abe85..c858a69 100644
    // Write the new descriptor sets.
  
    // Consecutive bindings updated via a single VkWriteDescriptorSet must have
-@@ -7082,9 +7382,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -7082,9 +7394,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
        constants_transient_descriptors_free_.pop_back();
      } else {
        VkDescriptorPoolSize constants_descriptor_count;
@@ -3120,7 +3236,7 @@ index 24abe85..c858a69 100644
            descriptor_set_layout_constants_, &constants_descriptor_count, 1);
        if (constants_descriptor_set == VK_NULL_HANDLE) {
          return false;
-@@ -7101,9 +7401,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -7101,9 +7413,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
        write_constants.dstBinding = i;
        write_constants.dstArrayElement = 0;
        write_constants.descriptorCount = 1;
@@ -3132,7 +3248,7 @@ index 24abe85..c858a69 100644
        write_constants.pTexelBufferView = nullptr;
      }
      write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
-@@ -7167,11 +7467,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -7167,11 +7479,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
    while (rex::bit_scan_forward(descriptor_sets_remaining, &descriptor_set_index)) {
      uint32_t descriptor_set_mask_tzcnt =
          rex::tzcnt(~(descriptor_sets_remaining | ((UINT32_C(1) << descriptor_set_index) - 1)));
@@ -4033,10 +4149,10 @@ index 306118e..65b07b5 100644
    // From most likely the latest to most likely the earliest to be signaled, so
    // just one sleep will likely be needed.
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..d7cffe3 100644
+index 7360ed9..d3731d6 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
-@@ -12,6 +12,7 @@
+@@ -12,11 +12,13 @@
  #include <algorithm>
  #include <atomic>
  #include <cctype>
@@ -4044,7 +4160,13 @@ index 7360ed9..d7cffe3 100644
  #include <utility>
  
  #include <rex/assert.h>
-@@ -26,6 +27,17 @@
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
++#include <rex/diagnostic_trace.h>
+ #include <rex/platform.h>
+ #include <rex/ui/presenter.h>
+ #include <rex/ui/window.h>
+@@ -26,6 +28,17 @@
  #include <ffx_api/ffx_upscale.h>
  #endif
  
@@ -4062,7 +4184,7 @@ index 7360ed9..d7cffe3 100644
  REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                      "Allow presentation from non-UI thread");
  
-@@ -287,6 +299,8 @@ Presenter::~Presenter() {
+@@ -287,6 +300,8 @@ Presenter::~Presenter() {
    // it if needed.
    assert_false(is_executing_ui_drawers_);
  
@@ -4071,7 +4193,7 @@ index 7360ed9..d7cffe3 100644
  #if REX_PLATFORM_WIN32
    if (dxgi_ui_tick_thread_.joinable()) {
      {
-@@ -449,6 +463,11 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+@@ -449,6 +464,11 @@ void Presenter::PaintFromUIThread(bool force_paint) {
    if (ui_thread_paint_requested_.exchange(false, std::memory_order_relaxed)) {
      do_paint = true;
    }
@@ -4083,18 +4205,36 @@ index 7360ed9..d7cffe3 100644
    PaintResult paint_result = PaintResult::kNotPresented;
    bool request_repaint_at_tick = false;
    bool request_repaint_immediately = false;
-@@ -582,6 +601,10 @@ bool Presenter::RefreshGuestOutput(
+@@ -481,9 +501,16 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+       // in a way so that the UI won't be stealing all the remaining GPU
+       // resources if it's repainted continuously, and the window system itself
+       // doesn't limit the frame rate.
++#if REX_PLATFORM_PS5
++      rex::diagnostic::Event(11);
++#endif
+       WaitForUITickFromUIThread();
+ 
+       paint_result = PaintAndPresent(draw_ui);
++#if REX_PLATFORM_PS5
++      rex::diagnostic::Event(12, frame_pacing_acquired_image_.load(std::memory_order_acquire),
++                              uint64_t(paint_result));
++#endif
+       if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+         // Request another PaintFromUIThread which will try to recover from the
+         // outdated connection in the next frame (not immediately, so the
+@@ -582,6 +609,11 @@ bool Presenter::RefreshGuestOutput(
    // after switching from UI thread painting to doing it in the guest output
    // thread, will immediately recover to having the latest frame always sent to
    // the host present call on the CPU and all frames reaching a present call).
 +#if REX_PLATFORM_PS5
 +  // Publish identity with the mailbox's release, before the consumer can acquire it.
 +  frame_pacing_image_sequence_[guest_output_mailbox_writable_] = ++frame_pacing_next_image_;
++  rex::diagnostic::Event(3, frame_pacing_next_image_, guest_output_mailbox_writable_);
 +#endif
    uint32_t last_acquired_and_ready =
        guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
    // Desired acquired = current acquired (changed only by the consumers).
-@@ -613,6 +636,24 @@ bool Presenter::RefreshGuestOutput(
+@@ -613,6 +645,28 @@ bool Presenter::RefreshGuestOutput(
      guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
    }
  
@@ -4110,7 +4250,11 @@ index 7360ed9..d7cffe3 100644
 +        frame_pacing_interval_ms_ = frame_pacing_interval_ms_ * 0.75 + delta_ms * 0.25;
 +      }
 +      frame_pacing_last_publish_ns_ = now_ns;
++      #if REX_PLATFORM_PS5
++      frame_pacing_published_ = frame_pacing_next_image_;
++      #else
 +      ++frame_pacing_published_;
++      #endif
 +    }
 +    frame_pacing_condition_.notify_one();
 +    return is_active;
@@ -4119,7 +4263,7 @@ index 7360ed9..d7cffe3 100644
    // Trigger the presentation on the host.
    PaintResult paint_result = PaintResult::kNotPresented;
    {
-@@ -796,9 +837,181 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
+@@ -796,9 +850,190 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
    dxgi_ui_tick_thread_ = std::thread(&Presenter::DXGIUITickThread, this);
  #endif  // XE_PLATFORM
  
@@ -4162,7 +4306,7 @@ index 7360ed9..d7cffe3 100644
 +      std::unique_lock<std::mutex> lock(frame_pacing_mutex_);
 +      if (!streaming) {
 +        frame_pacing_condition_.wait(lock, [&] {
-+          return frame_pacing_shutdown_ || frame_pacing_published_ != consumed;
++          return frame_pacing_shutdown_ || frame_pacing_published_ > consumed;
 +        });
 +      }
 +      if (frame_pacing_shutdown_) {
@@ -4173,7 +4317,7 @@ index 7360ed9..d7cffe3 100644
 +    }
 +    // 60 Hz display: guest frames at 30 FPS take two refreshes, at 60 FPS one.
 +    const uint32_t refreshes_per_frame = interval_ms > 25.0 ? 2 : 1;
-+    const bool new_frame = published != consumed;
++    const bool new_frame = published > consumed;
 +    const bool consume = new_frame && (!streaming || shown_refreshes >= refreshes_per_frame);
 +    if (!consume && shown_refreshes >= refreshes_per_frame + 2) {
 +      // The guest stopped producing frames (loading, pause): the display keeps
@@ -4185,11 +4329,13 @@ index 7360ed9..d7cffe3 100644
 +    // VideoOut queues flips asynchronously. Do not stuff the FIFO with copies
 +    // of the held image or count queued presents as completed display refreshes.
 +    if (!consume) {
-+      if (rex_ps5_display_wait_vblank()) {
-+        ++shown_refreshes;
-+      } else {
-+        streaming = false;
-+      }
++      // Publication can arrive immediately after this check. Waiting for a
++      // vblank here needlessly defers it by a refresh; wake on publication.
++      std::unique_lock<std::mutex> lock(frame_pacing_mutex_);
++      frame_pacing_condition_.wait(lock, [&] {
++        return frame_pacing_shutdown_ || frame_pacing_published_ > consumed;
++      });
++      if (frame_pacing_shutdown_) return;
 +      continue;
 +    }
 +    {
@@ -4197,6 +4343,8 @@ index 7360ed9..d7cffe3 100644
 +      frame_pacing_condition_.wait_until(lock, next_request,
 +                                        [&] { return frame_pacing_shutdown_; });
 +      if (frame_pacing_shutdown_) return;
++      published = frame_pacing_published_;
++      if (published <= consumed) continue;
 +    }
 +    // Schedule from request time, not completion time: scanout latency must
 +    // not be added to the frame period. The PS5 output runs at 59.94 Hz.
@@ -4225,6 +4373,7 @@ index 7360ed9..d7cffe3 100644
 +      } else if (paint_mode_ == PaintMode::kUIThreadOnRequest && consume) {
 +#if REX_PLATFORM_PS5
 +        frame_pacing_consume_pending_.store(true, std::memory_order_release);
++        rex::diagnostic::Event(4, published, previous_flip);
 +#endif
 +        RequestPaintOrConnectionRecoveryViaWindow(true);
 +        ui_paint_requested = true;
@@ -4247,7 +4396,11 @@ index 7360ed9..d7cffe3 100644
 +      flip_verified = true;
 +    }
 +    if (streaming) {
-+      consumed = published;
++      rex::diagnostic::Event(6, frame_pacing_acquired_image_.load(std::memory_order_acquire),
++                               rex_ps5_display_flip_serial());
++      // The UI may acquire a newer ready image than the request snapshot.
++      // Acknowledge the image actually displayed, never the stale snapshot.
++      consumed = frame_pacing_acquired_image_.load(std::memory_order_acquire);
 +      shown_refreshes = refreshes_per_frame;
 +      static uint64_t last_image = 0;
 +      static uint64_t completed_images = 0;
@@ -4301,7 +4454,7 @@ index 7360ed9..d7cffe3 100644
  std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
      uint32_t& mailbox_index_or_max_if_inactive_out, GuestOutputProperties* properties_out,
      GuestOutputPaintConfig* paint_config_out) {
-@@ -824,10 +1037,18 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+@@ -824,10 +1059,18 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
    // consumer though, the consumer mutex performs memory access ordering).
    uint32_t old_acquired_and_ready =
        guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
@@ -4322,7 +4475,7 @@ index 7360ed9..d7cffe3 100644
    // Either the same image as during the last consumption, or a new one, is
    // satisfying. However, if it's new, using memory_order_acq_rel to acquire the
    // new ready image (to make it acquired) and to release the old acquired image
-@@ -837,9 +1058,16 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+@@ -837,9 +1080,17 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
               old_acquired_and_ready, desired_acquired_and_ready, std::memory_order_acq_rel,
               std::memory_order_relaxed)) {
      desired_acquired_and_ready =
@@ -4335,12 +4488,13 @@ index 7360ed9..d7cffe3 100644
 +  if (!hold) {
 +    frame_pacing_acquired_image_.store(frame_pacing_image_sequence_[mailbox_index],
 +                                       std::memory_order_release);
++    rex::diagnostic::Event(5, frame_pacing_image_sequence_[mailbox_index], mailbox_index);
 +  }
 +#endif
    // Give the current acquired image to the caller, or UINT32_MAX if it's
    // inactive.
    const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
-@@ -1310,6 +1538,11 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
+@@ -1310,6 +1561,11 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
      // lifecycle.
      return PaintMode::kNone;
    }

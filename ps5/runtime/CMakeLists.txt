@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(forza_ps5_runtime LANGUAGES C CXX)
+add_compile_options(-gline-tables-only)
 
 if(NOT PS5 OR NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
     message(FATAL_ERROR "Use ps5/cmake/native.cmake for this cross-build")

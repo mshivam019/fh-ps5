@@ -103,6 +103,7 @@ static bool check_fibers() {
     return passed;
 }
 
+void StartDiagnosticTrace(const char* marker_path, const char* output_path);
 int main() {
     // RADV keeps its shader cache in a database of 50 parts by default, with
     // two open files per part. Once Forza's cache filled enough parts, fopen
@@ -112,6 +113,8 @@ int main() {
     // before the GPU starts.
     setenv("MESA_DISK_CACHE_DATABASE_NUM_PARTS", "4", 0);
     platform_init("Forza Horizon");
+    mkdir("/app0/logs", 0777);
+    StartDiagnosticTrace("/app0/trace.enable", "/app0/logs/frame-trace.bin");
     if (!check_fibers()) return 1;
     // The game code is a private module prepared by the desktop setup; load it
     // before anything else, as static initialization would have run.

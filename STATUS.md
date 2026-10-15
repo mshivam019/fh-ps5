@@ -248,3 +248,97 @@ tools/linux-run.sh TAG SECONDS [args]            # headless Linux run with scree
 SDK changes are made in `.deps/rexglue-sdk`, mirrored into the scratch repo
 `.deps/sdk-merge` (branch `forza-ps5`), committed there, and exported with
 `git -C .deps/sdk-merge diff forza-base forza-ps5 > ps5/patches/rexglue-ps5.patch`.
+
+## Bounded frame diagnostics
+
+The optimized native build retains local DWARF information in
+`build/native-title/link/llvm-pie.elf`. The console executable remains packaged
+without those debug sections. Keep the matching ELF when collecting addresses.
+
+Create `/app0/trace.enable` before launch to enable the diagnostic capture.
+Without the marker, tracing stays disabled. The capture writes
+`/app0/logs/frame-trace.bin` on a background thread every two seconds. Producers
+reserve fixed slots without allocation, file writes or waiting. Capture stops
+at ten minutes or 65,536 events; kernel messages report capacity drops and write
+errors. A new diagnostic launch replaces the previous binary capture, so
+download it first. Removing the marker disables capture on the next launch.
+
+Events cover GPU swap arrival, mailbox publication and acquisition, paced UI
+requests, UI paint boundaries, native flip submission and observed completion.
+Spans over two milliseconds cover command starvation, blocking submission-fence
+checks, swap submission, swap processing and host-file reads with paths and
+requested byte counts. These do not measure decompression, every guest wait,
+CPU scheduling or GPU execution duration directly. Do not infer those causes
+from missing events.
+
+Download the binary over FTP and decode locally:
+
+```sh
+python3 tools/frame-trace.py build/console/frame-trace.bin \
+  --json build/console/frame-trace-report.json
+```
+
+The report correlates distinct-image gaps over 45 ms with publication,
+acquisition, native submission and completion observations. Overlapping slow
+reads/waits are evidence of temporal overlap, not proof of causality.
+The decoder ignores an incomplete final record when reading a live download.
+
+Local verification: four concurrent producers submitted 80,000 events.
+The capture preserved 65,536 intact unique events, reported 14,464 drops, and
+reported no write error under AddressSanitizer and UndefinedBehaviorSanitizer.
+Disabled capture created no output. A deterministic correlation scenario
+verified frame timing, slow-read overlap and partial-final-record decoding.
+The native display bridge sanitizer regression also passes.
+
+The console diagnostic executable preserves the previous working executable as
+`eboot.bin.before-frame-diagnostics-20261015-201643`. Saves, graphics settings,
+thumbnail readbacks and shader caches are unchanged.
+
+### First diagnostic findings
+
+The preserved recent trace (`build/console/diagnostic-recent-trace.bin`) contains
+59,983 events over 202.565 seconds. Its decoded report is
+`build/console/diagnostic-recent-report.json`; runtime evidence is
+`build/console/diagnostic-recent-runtime.log` (`forza_022.log`).
+
+- An early 183.508 ms distinct-image gap overlaps a 156.061 ms command-starvation
+  span. Publication to acquisition takes 0.926 ms and acquisition to native flip
+  takes 0.689 ms. The long delay is upstream of presentation.
+- Later distinct-image gaps of 100.104/83.455/83.431 ms follow consecutive
+  publication intervals of 100.704/86.374/83.746 ms. Those images were already
+  late when published; their UI request-to-acquire times are below 0.8 ms.
+- The longest recorded file read is 9.040 ms; the longest recorded blocking
+  fence-check span is 9.016 ms. Neither alone establishes the cause of those
+  later 83–100 ms gaps. Decompression, guest simulation, CPU command processing,
+  register waits and descheduling are not yet separated by this first capture.
+- A concrete mailbox race repeats a displayed image: the request snapshots
+  publication 2031, but the UI acquires image 2032. Acknowledging 2031 permits
+  another request for image 2032, followed by a 66.728 ms distinct-image gap.
+
+The correction uses the actual acquired image sequence for completion
+accounting and the same sequence for publication. Monotonic comparisons also
+handle acquisition ahead of the publisher's notification. The pacer waits for
+publication rather than waiting an extra vblank while no image is ready.
+A local replay covers the observed stale snapshot, skipped publications and
+acquisition-ahead-of-notification boundaries.
+
+The narrowed diagnostic capture also records GPU `WAIT_REG_MEM` spans over
+two milliseconds, with register/address and wait flags. This distinguishes a
+command-stream synchronization wait from the empty-command-ring wait.
+The previous diagnostic executable is backed up as
+`eboot.bin.before-publication-accounting-20261015-202230`.
+
+Corrected console capture `publication-accounting` remained running through
+the 40-second smoke. Its subsequent binary download contains 21,623 events over
+54.395 seconds, with **zero repeated-image completions** across 1,912 confirmed
+presentations. The prior capture exposed the repeated-image race. The corrected
+capture also contains 2,536 GPU-register-wait spans, confirming that the new
+marker is active; these waits include normal guest-vblank synchronization and
+are not inherently a bottleneck.
+
+This boot capture is not a controlled race/free-roam comparison. It still
+contains a 200.196 ms distinct-image gap during the captured startup sequence.
+The long game-side delivery stalls remain under investigation. Do not claim all
+stutters are fixed. Next acceptance needs a user-driven session with this build,
+then correlation of long publication gaps with command starvation, register
+waits, host reads and blocking submission waits.

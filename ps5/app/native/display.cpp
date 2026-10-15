@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <rex/diagnostic_trace.h>
 
 extern "C" {
 int __real_sceVideoOutOpen(int32_t, int32_t, int32_t, const void*);
@@ -42,6 +43,9 @@ extern "C" int __wrap_sceVideoOutSubmitFlip(int32_t handle, int32_t buffer,
   const int result = __real_sceVideoOutSubmitFlip(handle, buffer, mode, argument);
   if (result == 0 && handle == display_handle.load(std::memory_order_acquire)) {
     submitted_flip.store(uint64_t(argument), std::memory_order_release);
+    #if REX_PLATFORM_PS5
+    rex::diagnostic::Event(14, uint64_t(argument), buffer);
+    #endif
   }
   return result;
 }
@@ -75,6 +79,9 @@ extern "C" bool rex_ps5_display_wait_for_flip(uint64_t previous) {
                      (unsigned long long)status[3], handle);
         reported = true;
       }
+      #if REX_PLATFORM_PS5
+      rex::diagnostic::Event(15, status[3], previous);
+      #endif
       return true;
     }
     if (sceVideoOutWaitVblank(handle) != 0) return false;

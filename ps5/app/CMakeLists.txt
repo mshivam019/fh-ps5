@@ -24,7 +24,7 @@ execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/../to
     COMMAND_ERROR_IS_FATAL ANY)
 
 add_library(forza_app STATIC main.cpp builtin-module.cpp input.cpp button_prompts.cpp
-    native/platform.c native/display.cpp
+    native/platform.c native/display.cpp diagnostic_trace.cpp
     "${FORZA_MODULE_DIR}/loader.cpp" "${FORZA_MODULE_DIR}/game_module.cpp"
     "${FORZA_MODULE_GENERATED}/module_exports.cpp"
     "${FORZA_UPSTREAM}/src/platform/motion_blur_fix.cpp"
@@ -33,4 +33,4 @@ target_link_libraries(forza_app PRIVATE forza_ps5_runtime imgui)
 target_include_directories(forza_app PRIVATE "${FORZA_MODULE_GENERATED}"
     "${FORZA_SDK}/thirdparty/xxHash")
 target_compile_definitions(forza_app PRIVATE REXGLUE_BUILD_CONFIG="Release")
-target_compile_options(forza_app PRIVATE -O2 -g0)
+target_compile_options(forza_app PRIVATE -O2 -gline-tables-only)

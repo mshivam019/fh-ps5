@@ -367,3 +367,30 @@ previous stop point, not yet a completed race acceptance test.
 `build/console/race-start-marker.json` records the user-reported race boundary.
 Exclude earlier boot/title samples from gameplay comparisons. The current race
 capture requires the user's playtest; do not restart the title during it.
+
+### Race-only diagnostic snapshot
+
+`build/console/race-live-trace.bin` reached the fixed 65,536-event bound at
+204.477 seconds. The user-reported race boundary is 108.444 seconds, leaving
+96.033 seconds of race-only data. The bounded binary capture has stopped;
+runtime logging and the game continue. No restart or build replacement occurred
+during this race. The decoded report is `build/console/race-live-report.json`.
+
+The race section has 2,820 confirmed completions, zero repeated images, and
+113 distinct-image gaps above 45 ms. Its distinct-completion rate is about
+29.36 Hz. A 100.103 ms display gap follows a 100.169 ms publication gap; other
+83.428/83.416 ms gaps follow 84.252/83.752 ms publication intervals. The frame
+delivery path remains late before the UI can present those images.
+
+There are no host-read spans above two milliseconds in this race section.
+Fourteen recorded blocking fence spans reach at most 8.495 ms; thirteen
+command-starvation spans reach at most 16.614 ms. Neither class explains the
+largest gaps by itself. GPU-register-wait spans occur 2,772 times, with median
+14.047 ms, p95 17.767 ms and maximum 19.932 ms. Their common address is
+`0x1fca4006`, flags `0x13`, wait `0x100`; normal guest-vblank waits are included.
+Do not remove these synchronization waits based only on their aggregate time.
+
+The remaining unclassified time includes CPU command processing, guest
+scheduling and waits shorter than the span threshold. The next diagnostic
+slice must attribute time between command processing and guest synchronization,
+not repeat file-cache changes or claim that all stutters are fixed.

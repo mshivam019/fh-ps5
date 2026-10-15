@@ -5,13 +5,13 @@ Native PS5 port of **Forza Horizon** (Xbox 360, 2012, title `4D5309C9`), based o
 (Dyotson, MIT; `main` at `c97e172` on October 15, 2026), which statically
 recompiles the game with the ReXGlue SDK, the same toolchain as the Naruto PS5
 port. Proposed title ID: **PPSA99690** (free in the homebrew catalog and on the
+console as of October 15, 2026).
 
 Why Forza Horizon 1 and not 2: the only Forza Horizon 2 PC port ("Azimuth" by
 Almost There Games on itch.io, October 2026) is a closed-source launcher built on
 the **Xbox One** version (x86-64 with Xbox system calls shimmed to Windows and
 DirectX 12). There is no source, and the ReXGlue toolchain this port reuses
 does not apply to it. No Forza Horizon 2 Xbox 360 recompilation exists.
-console as of October 15, 2026).
 
 ## Starting point
 

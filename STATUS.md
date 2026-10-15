@@ -342,3 +342,28 @@ The long game-side delivery stalls remain under investigation. Do not claim all
 stutters are fixed. Next acceptance needs a user-driven session with this build,
 then correlation of long publication gaps with command starvation, register
 waits, host reads and blocking submission waits.
+
+### Cadence-transition regression and active race capture
+
+The user reported that gameplay continued behind a black screen with the
+publication-accounting build. `build/console/black-screen-trace.bin` confirms
+presentation stopped at 82.877 seconds while image publication continued to
+138.440 seconds. The old refresh-count gate required two refreshes after a
+60-to-30 FPS transition, while its replacement publication wait no longer
+incremented the refresh count. This prevented all subsequent paint requests.
+
+The PS5 path now admits every new image subject only to the request deadline;
+the non-PS5 refresh-count policy is unchanged. A local state replay reproduces
+the old loop making 1,000 iterations without a paint request and checks liveness
+across both cadence transitions and steady cadences.
+
+The corrected build is installed; the prior executable is preserved as
+`eboot.bin.before-cadence-transition-20261015-202610`. The 100-second console
+capture remained running. At the user's race-start report, a subsequent binary
+snapshot spans 108.444 seconds and contains 3,267 confirmed display completions
+with zero repeated images. This demonstrates continued presentation past the
+previous stop point, not yet a completed race acceptance test.
+
+`build/console/race-start-marker.json` records the user-reported race boundary.
+Exclude earlier boot/title samples from gameplay comparisons. The current race
+capture requires the user's playtest; do not restart the title during it.

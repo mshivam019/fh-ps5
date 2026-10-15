@@ -4149,7 +4149,7 @@ index 306118e..65b07b5 100644
    // From most likely the latest to most likely the earliest to be signaled, so
    // just one sleep will likely be needed.
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..d3731d6 100644
+index 7360ed9..a23c037 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -12,11 +12,13 @@
@@ -4263,7 +4263,7 @@ index 7360ed9..d3731d6 100644
    // Trigger the presentation on the host.
    PaintResult paint_result = PaintResult::kNotPresented;
    {
-@@ -796,9 +850,190 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
+@@ -796,9 +850,196 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
    dxgi_ui_tick_thread_ = std::thread(&Presenter::DXGIUITickThread, this);
  #endif  // XE_PLATFORM
  
@@ -4318,7 +4318,13 @@ index 7360ed9..d3731d6 100644
 +    // 60 Hz display: guest frames at 30 FPS take two refreshes, at 60 FPS one.
 +    const uint32_t refreshes_per_frame = interval_ms > 25.0 ? 2 : 1;
 +    const bool new_frame = published > consumed;
++    #if REX_PLATFORM_PS5
++    // Request deadlines govern PS5 cadence. Refresh-count gating can deadlock
++    // when the estimated period changes from one refresh to two.
++    const bool consume = new_frame;
++    #else
 +    const bool consume = new_frame && (!streaming || shown_refreshes >= refreshes_per_frame);
++    #endif
 +    if (!consume && shown_refreshes >= refreshes_per_frame + 2) {
 +      // The guest stopped producing frames (loading, pause): the display keeps
 +      // the last image; wait for the next frame.
@@ -4454,7 +4460,7 @@ index 7360ed9..d3731d6 100644
  std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
      uint32_t& mailbox_index_or_max_if_inactive_out, GuestOutputProperties* properties_out,
      GuestOutputPaintConfig* paint_config_out) {
-@@ -824,10 +1059,18 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+@@ -824,10 +1065,18 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
    // consumer though, the consumer mutex performs memory access ordering).
    uint32_t old_acquired_and_ready =
        guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
@@ -4475,7 +4481,7 @@ index 7360ed9..d3731d6 100644
    // Either the same image as during the last consumption, or a new one, is
    // satisfying. However, if it's new, using memory_order_acq_rel to acquire the
    // new ready image (to make it acquired) and to release the old acquired image
-@@ -837,9 +1080,17 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+@@ -837,9 +1086,17 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
               old_acquired_and_ready, desired_acquired_and_ready, std::memory_order_acq_rel,
               std::memory_order_relaxed)) {
      desired_acquired_and_ready =
@@ -4494,7 +4500,7 @@ index 7360ed9..d3731d6 100644
    // Give the current acquired image to the caller, or UINT32_MAX if it's
    // inactive.
    const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
-@@ -1310,6 +1561,11 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
+@@ -1310,6 +1567,11 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
      // lifecycle.
      return PaintMode::kNone;
    }

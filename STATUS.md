@@ -53,8 +53,12 @@ are 150 with no frame over 50 ms. Bad windows drop to 114–144 frames.
 | The graphics thread waits for the GPU | `fence_ms` 30–96 ms per 5 s (normal ~1) |
 | Heavy command processing | ~3,000 draws per frame; the sampled draw cost is 45–60% of the graphics thread |
 
-On Linux (Ryzen laptop) the game's main guest thread is also at ~99% of a core, so
-the CPU side is close to its limit at 30 FPS.
+The high-utilization guest thread spends much of its sampled CPU time polling
+graphics progress. Its utilization alone does not establish a simulation
+bottleneck. The October 15 console capture contains 125,414 samples, with none
+dropped. In 330.9 seconds of high-draw log windows, draw processing takes a
+median 2.72 seconds per five-second window, while pipeline waits take 0.7 ms.
+The capture does not attribute every individual hitch to a specific operation.
 
 ### Plan, in order
 
@@ -71,6 +75,28 @@ the CPU side is close to its limit at 30 FPS.
    game's main thread and the graphics thread use; cap pipeline workers (3–4).
 5. Re-measure on the console after each step: same route, 5 minutes, compare
    `PS5 frame timing` windows.
+
+### Resident-stream scan comparison candidate
+
+`VulkanCommandProcessor::IssueDraw` now removes already-resident vertex streams
+from each shader fetch mask before scanning it. Missing streams still follow the
+same fetch validation, residency request, and invalidation paths. No graphics
+features, readbacks, saves, or caches are disabled.
+
+- Mask equivalence: 40,028 cases cover indices 0–95 and full/partial invalidation.
+- C++ smoke: 1,024 random masks agree. A five-million-draw resident-only
+  microbenchmark takes 12.53 ms versus 46.18 ms for the old scan. This measures
+  only that small loop, not game frame time.
+- Linux 180-second boot-to-drive smoke renders the world and car. Guest p95 is
+  34.9 ms versus 35.0 ms in the control. Presentation results vary substantially
+  between runs; they do not establish a whole-game stutter improvement.
+- PS5 runtime and app build successfully. Console race/free-roam comparison is
+  required before claiming a frame-pacing improvement.
+
+Rejected experiments: fence-poll sleeping lowered CPU utilization without
+improving pacing. Unchanged shader-constant comparisons provided no throughput
+gain and were removed. Neither experiment is included in this candidate.
+
 
 ## Other open items
 

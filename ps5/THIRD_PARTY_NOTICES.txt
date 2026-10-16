@@ -1,0 +1,36 @@
+Forza Horizon for PS5 — third-party notices
+
+Project code: MIT (licenses/Forza-PS5-MIT.txt).
+
+The app (eboot.bin) contains:
+- ReXGlue SDK runtime and Xenos GPU backend, including Xenia-derived code:
+  BSD 3-Clause (licenses/ReXGlue-BSD-3-Clause.txt). Modified for PS5; the
+  changes are ps5/patches/rexglue-ps5.patch in the source repository.
+- fmt, spdlog, Dear ImGui, o1heap, SIMDe, toml++, Vulkan Memory Allocator: MIT.
+- xxHash: BSD 2-Clause. aes_128: see licenses/aes_128.txt.
+- glslang: BSD 3-Clause / Apache-2.0 and others (licenses/glslang.txt).
+- libmspack: LGPL-2.1 (licenses/libmspack-LGPL-2.1.txt).
+- FFmpeg (configured decoder subset): LGPL-2.1-or-later (licenses/FFmpeg-*).
+- SDL3: zlib (licenses/SDL.txt).
+- Mesa RADV Vulkan driver: MIT and per-file licenses (licenses/Mesa.txt).
+- LLVM libc++/libc++abi/libunwind: Apache-2.0 WITH LLVM-exception (licenses/LLVM.txt).
+- PS5 payload SDK and platform layer: GPL-3.0-or-later with per-file
+  exceptions (licenses/PS5-SDK.txt).
+- PS5 Vulkan and its template (native display, link recipe, platform.c,
+  libc.prx): licenses/PS5-Vulkan.txt and licenses/PS5-Vulkan-Template-MIT.md.
+
+Each release includes a dependency source archive with the exact source of
+these components, including local modifications.
+
+Setup, on the player's computer, downloads and uses: Forza Horizon 1:
+ReImagined (Dyotson/RecompiledForzaHorizon, MIT; code-generation configuration,
+game hooks and SDK patches), the ReXGlue SDK, llvm-mingw (LLVM) and the PS5
+payload SDK headers.
+
+The dynamic-buffer content tracking in the PS5 runtime patch follows the
+approach of PS5X360 (BrinooTk, GPL-3.0-or-later components; reimplemented here
+inside the BSD-licensed ReXGlue shared memory code, off by default).
+
+Forza Horizon and its content belong to their owners. This project includes no
+game data. The app icon and backgrounds are made from a public-domain U.S.
+National Park Service photograph with DejaVu Sans lettering (ps5/sce_sys/CREDITS.md).

@@ -1,0 +1,10 @@
+{
+  "forza": {
+    "url": "https://github.com/Dyotson/RecompiledForzaHorizon",
+    "revision": "c97e1729ac648c263b58034918f6e70db81bc06e"
+  },
+  "rexglue_sdk": {
+    "url": "https://github.com/rexglue/rexglue-sdk",
+    "revision": "bd833a2ab69d305f99ddf57418fc38ffec8af93d"
+  }
+}

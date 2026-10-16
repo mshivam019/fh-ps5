@@ -1,0 +1,50 @@
+# PS5 defaults. Keep compiled shader descriptions between sessions.
+store_shaders = true
+log_level = "info"
+log_noisy = false
+log_flush_interval = 1
+
+# New shaders compile in the background: draws that need them are skipped for
+# the few frames they take, instead of the frame waiting for the compiler and
+# then being dropped. Every compiled pipeline is stored and rebuilt at the next
+# start, so a place looks complete from the second visit on.
+vulkan_async_pipeline_wait_at_submission = false
+vulkan_async_skip_incomplete_frames = false
+
+# The game reads back car thumbnails it renders for the garage and profile.
+# "some" copies a resolve back the first time it is seen, which is what the
+# thumbnails need, and costs nothing in a race (upstream default).
+readback_resolve = "some"
+
+# Keep adjacent guest command buffers in one submission until required synchronization.
+vulkan_submit_on_primary_buffer_end = false
+
+# Keep CPU-uploaded GPU pages valid across frames; guest writes invalidate them
+# through write watches (16 KB host pages are watched when any guest page in
+# them is writable). Set true to re-upload every frame if graphics go stale.
+clear_memory_page_state = false
+
+# GPU shared memory validity/watch page size; 0 is the host page (16 KiB).
+# 64 KiB (16) was measured on October 16: uploads 2.5x higher, write faults
+# up 40%, protection changes not fewer. Keep the host page size.
+shared_memory_page_log2 = 0
+
+# Deferred asynchronous completions (save content mounts) completed after a
+# fixed 100 ms emulated latency; a save does two, and the game waited for
+# them. 16 ms keeps the completion asynchronous without the stall.
+deferred_overlapped_delay_ms = 16
+
+# Diagnostics: log every GPU command frame over 45 ms with its stage breakdown
+# (dispatch, textures, buffers, waits), thread CPU time and memory
+# synchronization counters. Costs a cycle read per draw stage; off by default.
+ps5_long_frame_log = false
+
+# Content comparison for repeatedly rewritten vertex pages (PS5X360 approach).
+# Measured off on October 16: protection syscalls and faults per busy frame
+# unchanged (they come from newly streamed data), render CPU +2 ms from
+# per-draw hashing. Kept available; off.
+shared_memory_dynamic_vertices = false
+
+# Present each frame for whole display refreshes (two at 30 FPS) from a pacing
+# thread, instead of whenever the frame is ready: removes uneven frame times.
+present_frame_pacing = true

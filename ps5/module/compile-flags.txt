@@ -1,0 +1,37 @@
+# Flags for compiling the generated game code into the module, one per line.
+# {SYSROOT}: PS5 payload SDK; {SDK}: ReXGlue SDK source with the PS5 patch.
+-target
+x86_64-sie-ps5
+-fvisibility-nodllstorageclass=default
+-isysroot
+{SYSROOT}
+-isystem
+{SYSROOT}/target/include/c++/v1
+-isystem
+{SYSROOT}/target/include
+-fno-stack-protector
+-fno-plt
+-femulated-tls
+-DREX_HAS_VULKAN=1
+-DSPDLOG_COMPILED_LIB
+-DSPDLOG_FMT_EXTERNAL
+-D__PROSPERO__
+-I{SDK}/include
+-I{SDK}/thirdparty/simde
+-I{SDK}/thirdparty/simde/simde
+-I{SDK}/thirdparty/fmt/include
+-I{SDK}/thirdparty/spdlog/include
+-fexceptions
+-fcxx-exceptions
+-frtti
+-fPIC
+-ffunction-sections
+-fdata-sections
+-DNDEBUG
+-std=gnu++23
+-march=x86-64-v2
+-O2
+-g0
+-fno-strict-aliasing
+-ffp-model=strict
+-w

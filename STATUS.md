@@ -1179,3 +1179,21 @@ command_processor.cpp and system/CMakeLists.txt. SDK changes mirrored into
 ps5/tests/{wait_primitives,title_waits}.cpp and matching ps5/tools/test-*.sh.
 
 Stopped. No additional work is pending authorization within this active turn.
+
+## October 16 — v0.1.0 released; setup verified end to end; catalog record staged
+
+- `main` squashed to one commit (b656062), tagged v0.1.0; stable release at
+  https://github.com/mshivam019/fh-ps5/releases/tag/v0.1.0 with PPSA99690.zip
+  (e39554fc…), setup ZIP, dependency sources tar + manifest, SHA256SUMS.
+  Console runs the release executable bf7a02bc… and config.
+- Released setup ZIP run in a clean folder on disk (`../setup-e2e-test`) on the
+  user's disc: 9 min 47 s, 2,401 files, 6.9 GB; its forza.module
+  (714ce59c…, 120,079,096 bytes) differs byte-wise from the development build
+  (748d87b5…) but the release app accepted it and ran (forza_043.log). It is now
+  installed; previous module backed up as `forza.module.before-setup-e2e-20261016-130818`.
+  A first attempt in the 7.5 GB /tmp RAM disk failed with ENOSPC during disc
+  extraction: setup needs about 20 GB on disk (documented in SETUP.md).
+- Catalog: record apps/PPSA99690.json committed on fork branch
+  `add-forza-horizon` (a9adbb1, from upstream main), `catalog check` passes;
+  `verify` fails only because the repository is private. **User instruction:
+  do not make fh-ps5 public until they say so; no PR until then.**

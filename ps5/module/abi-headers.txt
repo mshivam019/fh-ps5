@@ -46,6 +46,7 @@ include/rex/system/achievement_store.h
 include/rex/system/binary_types.h
 include/rex/system/export_resolver.h
 include/rex/system/function_dispatcher.h
+include/rex/system/gpu_write_signal.h
 include/rex/system/kernel_state.h
 include/rex/system/mmio_handler.h
 include/rex/system/module.h

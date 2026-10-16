@@ -24,7 +24,8 @@ HOOK_SOURCES = [*sorted((UPSTREAM / 'src/hooks').glob('*.cpp')),
                 *(UPSTREAM / 'src/debug' / name for name in (
                     'codriver_log.cpp', 'dlc_log.cpp', 'frame_stats.cpp', 'audio_level.cpp')),
                 UPSTREAM / 'src/platform/socket.cpp',
-                ROOT / 'ps5/module/forza_ps5.cpp']
+                ROOT / 'ps5/module/forza_ps5.cpp',
+                ROOT / 'ps5/module/title_waits.cpp']
 HOOK_FLAGS = ['-DFORZA_TITLE_UPDATE=0', f'-I{UPSTREAM / "src"}']
 
 

@@ -24,6 +24,27 @@ vulkan_submit_on_primary_buffer_end = false
 # them is writable). Set true to re-upload every frame if graphics go stale.
 clear_memory_page_state = false
 
+# GPU shared memory validity/watch page size; 0 is the host page (16 KiB).
+# 64 KiB (16) was measured on October 16: uploads 2.5x higher, write faults
+# up 40%, protection changes not fewer. Keep the host page size.
+shared_memory_page_log2 = 0
+
+# Deferred asynchronous completions (save content mounts) completed after a
+# fixed 100 ms emulated latency; a save does two, and the game waited for
+# them. 16 ms keeps the completion asynchronous without the stall.
+deferred_overlapped_delay_ms = 16
+
+# Diagnostics: log every GPU command frame over 45 ms with its stage breakdown
+# (dispatch, textures, buffers, waits), thread CPU time and memory
+# synchronization counters. Costs a cycle read per draw stage; off by default.
+ps5_long_frame_log = false
+
+# Content comparison for repeatedly rewritten vertex pages (PS5X360 approach).
+# Measured off on October 16: protection syscalls and faults per busy frame
+# unchanged (they come from newly streamed data), render CPU +2 ms from
+# per-draw hashing. Kept available; off.
+shared_memory_dynamic_vertices = false
+
 # Present each frame for whole display refreshes (two at 30 FPS) from a pacing
 # thread, instead of whenever the frame is ready: removes uneven frame times.
 present_frame_pacing = true

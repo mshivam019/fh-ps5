@@ -1,5 +1,9 @@
 # Forza Horizon PS5: status and plan
 
+This file and `PLAN.md` are kept on the `optimize-render-thread` branch. The
+October 16 lock/stutter investigation is recorded chronologically below; the
+handoff that used to be in `STUTTER-HANDOFF.md` follows at the end.
+
 Last updated: October 15, 2026. Repo `mshivam019/fh-ps5` (private), branch `main`.
 Console title: **PPSA99690**, installed on the M.2 at `/mnt/ext1/etaHEN/games/PPSA99690`.
 
@@ -535,3 +539,643 @@ Source checkpoint before this note: `52c494d` on `main`. Matching console
 symbols are `build/console/dispatch-stage-symbols.elf`. The preceding
 executable is retained on the console as
 `eboot.bin.before-dispatch-stage-diagnostics-20261015-205323`.
+
+
+### October 15 consolidated residency fix (resumed)
+
+User resumed stutter work, authorized restarting Forza, and requested exactly
+one final manual playtest. Do not ask for additional diagnostic races. The
+prior pause is superseded. Existing saves/configuration/cache are preserved.
+
+The completed prior trace is preserved as
+`build/console/stutter-resume-trace.bin`; race cutoff remains 113.893 seconds.
+It spans 394.749 seconds total, with 227 race-only display gaps over 45 ms,
+120 complete long command-frame snapshots, and 13 cumulative dropped events.
+The previous measured stage attribution is unchanged; it does not prove every
+hitch has one cause.
+
+Changes in the consolidated candidate:
+
+- Populate the shared-memory request cache when all requested pages are already
+  resident. Previously, after an unrelated invalidation advanced the epoch,
+  these successful requests repeatedly rescanned their pages instead of becoming
+  cache hits. Publish invalidation epochs after clearing validity, so new epochs
+  cannot acknowledge old page-valid bits.
+- Batch pending vertex streams through the existing RequestRanges merger before
+  a draw. Overlapping/adjacent ranges share validation/upload/barrier work. Mark
+  their residency only after the batch succeeds; preserve fetch and memory
+  invalidation. Scratch range storage is reused rather than cleared per draw.
+- Fast-path a single already-backed PS5 protection page without allocating
+  transaction bookkeeping or repeatedly searching the backing map. Kernel
+  failure leaves tracked permissions unchanged. Multi-page and allocation paths
+  retain the original rollback handling.
+
+Validation: native PS5 runtime/link/sign/import-layout checks pass. The real
+SharedMemory request implementation passes host UBSan checks for residency,
+invalidation, invalid input, overlapping ranges, upload failure/retry and
+invalidation during upload. The PS5 memory host-kernel regression passes,
+including the new single-page protection failure/retry case. An isolated
+2-million-request resident-cache benchmark improved from 27.273 ms to 8.914 ms
+(without sanitizer); this is not a whole-frame or console FPS result.
+
+Local Linux runs are rendering smoke tests, not a controlled performance A/B:
+the control overlapped compilation, and shader cache warmth differs. Do not
+claim a quantified gameplay improvement from them. Final deployment uses tracing
+disabled; retain the binary capture and marker backup. No graphics settings,
+readbacks, shader caches, saves, game module or artwork changes are intended.
+
+Evidence and deployment receipt: `build/stutter-fix/`. Source edits are mirrored
+in `.deps/sdk-merge` and exported in `ps5/patches/rexglue-ps5.patch`; patch reverse
+application against the working SDK is checked. No release or push requested.
+Gameplay stutter acceptance remains the user's single final test.
+
+Installed and raw-SHA verified consolidated executable:
+`d6f4e1e9aceb5ca9ddc17e0deac15211e1c706453d818301852196ba74d7838f`.
+Previous executable is preserved as
+`eboot.bin.before-residency-fix-20261015-211331`, with its raw hash verified.
+`trace.enable` was renamed to `trace.enable.disabled-20261015-211331`.
+The 45-second console smoke stayed running and read the existing profile.
+Its last startup window still contains guest gaps up to 83.4 ms, so this smoke
+is not proof of eliminated gameplay stutter. Do not describe these local
+optimizations as a verified complete cure. Leave the running build for the
+user's one final gameplay test. Linux smoke screenshot confirms rendered car,
+road and landscape: `build/stutter-fix/candidate-world.png`.
+
+User completed the single final race test. Downloaded `build/console/residency-race-finished-runtime.log` (`forza_027.log`). Post-smoke summary in `build/stutter-fix/final-race-summary.json`: 54 windows, 153.0 guest gaps over 50 ms, maximum 134.6 ms. No exact race start/end marker; includes possible menus/results. Stutter remains; do not claim the consolidated changes solved it or establish a controlled A/B gain. Detailed per-operation tracing was disabled, so this run cannot identify the remaining operation. No restart or further user test requested.
+
+Follow-up investigation and latest recording: `build/stutter-investigation/FINDINGS.md`. Actual shared-memory host reproduction exposes 1 MiB invalidation widening with PS5 pages versus 256 KiB with desktop pages. Local bounded candidate tested under UBSan; not applied or deployed. This is a candidate source of upload amplification, not proven race-hitch causality. Latest native recording is in Downloads as `ps5-native-1792081630-951ceba056.mp4`; original retained.
+
+
+### October 15 bounded-invalidation deployment authorized
+
+User explicitly requested deploying the bounded-invalidation candidate. Applied
+its 256 KiB cap on optional widening (all actual writes and GPU-written neighbour
+constraints remain covered). Native build/link/sign/import-layout checks pass;
+the applied production source passes the PS5-page UBSan bounds/upload regression.
+Reproducible test: `ps5/tools/test-shared-memory-bounds.sh`.
+
+Installed executable SHA-256:
+`7903b4e82b0ea6b2d72223c6fd9760d1dc3565ca38780caa9b34d3779d7026ee`.
+Installed and previous executable both verified by raw SHA-256. Rollback:
+`eboot.bin.before-bounded-invalidation-20261015-212621` (previous hash
+`d6f4e1e9aceb5ca9ddc17e0deac15211e1c706453d818301852196ba74d7838f`).
+Saves/settings/shader cache unchanged; detailed tracing remains disabled.
+Receipt: `build/stutter-investigation/deployment.json`. Source is mirrored and
+exported into the SDK patch; reverse-application check passed. No push/release.
+
+An absent trace marker was incorrectly treated as present by FTP SIZE, after
+the executable replacement. Recovery checked the complete FTX2 directory list,
+confirmed marker absence, verified both binaries and resumed launch without
+redeploying. Local deployment scripts now use explicit listing membership.
+Gameplay improvement is unproven; do not claim eliminated stutter.
+
+Bounded candidate launch smoke completed: still running after 45 seconds; runtime `forza_028.log` preserved as `build/console/bounded-invalidation-runtime.log`. Startup windows still include frame gaps; this launch check is not a race-performance result. Game left running.
+
+Bounded candidate follow-up log: `build/console/bounded-latest-runtime.log` (`forza_028.log`), summary `build/stutter-investigation/latest-log-summary.json`. Post-smoke 105.21 seconds: average 29.04 swap requests/s, 77 gaps above 50 ms, maximum 184.0 ms. Stutters persist. Race/menu boundaries unknown; not a controlled A/B. No restart or deployment during log check.
+
+
+## October 16 — PS5X360 memory optimizations adapted locally
+
+User requested adapting both relevant ideas from BrinooTk/PS5X360 at
+`ad628f65ed460416c45103f4867053c5086eab1d`. Implemented 4 KiB GPU upload/validity
+units with unchanged 16 KiB PS5 memory protection, plus content-checked dynamic
+vertex uploads after three actual host-page invalidations. Non-vertex requests,
+range watches and GPU-written data permanently pin their whole host page to
+normal tracking. Speculative invalidation widening does not increase heat.
+Dynamic units remain invalid and are checked on each draw; both fetch-residency
+shortcuts check dynamic eligibility and actual validity. Hashes are committed
+only after successful upload and only if their invalidation generation still
+matches. Failed uploads retry. Cache reset clears eligibility/hash generations;
+pins remain conservative. Unlike upstream's periodic heat aging, this candidate
+keeps dynamic pages eligible until an exact invalidation, reset or pin.
+
+`shared_memory_dynamic_vertices=false` safely returns requested ranges to normal
+tracking (validated). Default is true. Lightweight cumulative `Vertex memory:`
+logs report upload/protection sizes, transitions, hashed/skipped/uploaded bytes.
+GPU data and adjacent textures/indices cannot silently lose their protection.
+
+Native PS5 compilation, ELF layout validation and signing passed. Candidate:
+`build/ps5x360-adaptation/eboot.bin`, SHA-256
+`d23455ededf6e81266aee24be76cc7522914fb20507cfca7825f25f8e97c5835`.
+Linux Vulkan build passed. UBSan tests cover changed/unchanged real contents,
+failed upload retries, batched/overlapping ranges, whole-host-page pinning,
+GPU-written neighbours, registered watches, exact invalidation during upload,
+cache reset and disabled-feature fallback. Bounds tests confirm a 16 KiB callback
+invalidates four units and a following 4 KiB request uploads just 4096 bytes.
+Existing residency/failure tests passed; repeated resident-request fast path
+retained. Test scripts: `ps5/tools/test-{dynamic-vertex-memory,shared-memory,shared-memory-bounds}.sh`.
+
+Source mirrored into `.deps/sdk-merge` and exported to
+`ps5/patches/rexglue-ps5.patch`; reverse-application check passes. Prior files and
+patch backed up under `build/ps5x360-adaptation/`. No commit, push, release or
+console deployment in this step. Installed console candidate remains the prior
+bounded-invalidation build. Console saves/config/cache untouched. This is a
+prepared candidate, not evidence that PS5 stutters are fixed.
+
+Automated Linux smoke completed (160 seconds), with menu, intro and actual
+scripted driving screenshots inspected (HUD 123 mph at 144.50 seconds). Last
+memory counters: 304 dynamic transitions, 822,439,936 bytes hashed and
+799,432,704 redundant upload bytes skipped. This demonstrates the mechanism
+executing, not a controlled performance improvement or PS5 gameplay proof.
+Final renderer-reinitialization hash reset was subsequently built on both
+platforms and regression-tested with UBSan; the gameplay smoke was not repeated
+for that lifecycle-only adjustment. Final receipt: `build/ps5x360-adaptation/candidate.json`.
+
+## October 16 — PS5X360 candidate deployed
+
+User reported the console connected, making it available for deployment. Verified
+FTP and FTX2 live; no other game active. Installed frozen candidate
+`d23455ededf6e81266aee24be76cc7522914fb20507cfca7825f25f8e97c5835`.
+Staged, installed and rollback executable raw SHA-256 checks passed. Previous
+`7903b4e82b0ea6b2d72223c6fd9760d1dc3565ca38780caa9b34d3779d7026ee` is
+retained on console as `eboot.bin.before-ps5x360-memory-20261016-101507`.
+Saves/config/shader caches untouched; detailed trace marker absent.
+Receipt: `build/ps5x360-adaptation/deployment.json`. Launch requested; startup
+verification underway. Manual gameplay/performance acceptance pending.
+
+Startup verification completed: Forza still running after 45 seconds. Fresh
+`forza_029.log` confirms `upload-unit=4096 host-page=16384 dynamic=true`,
+72 dynamic transitions and 34,570,240 redundant upload bytes skipped. Startup
+had frame gaps (up to 116.6 ms); this does not establish race performance.
+Left Forza running for the user's single final test. Logs saved under
+`build/console/ps5x360-memory-*`; deployment receipt includes startup evidence.
+
+User reported two perceived stutters. Read-only follow-up fetched forza_029.log
+as `build/console/ps5x360-user-stutters-runtime.log`. Guest/display gaps both
+reach 150.1 ms; recent worst five-second window has 131 swap requests (26.2/s).
+Pipeline waits stay about 0.7–0.8 ms total per five-second window. Dynamic
+upload avoidance is active, but stutters persist. Detailed summary is
+`build/ps5x360-adaptation/user-stutters-summary.json`; remaining cause is not
+isolated. No restart, configuration change or deployment during this check.
+
+## October 16 — both PS5X360 memory optimizations withdrawn
+
+User explicitly requested undoing the 4 KiB GPU upload units and dynamic vertex
+content checks. Restored the exact previous executable, raw SHA-256 verified:
+`7903b4e82b0ea6b2d72223c6fd9760d1dc3565ca38780caa9b34d3779d7026ee`.
+This retains the earlier bounded-invalidation changes that preceded this trial.
+Experimental binary retained as `eboot.bin.withdrawn-ps5x360-20261016-102128`.
+Saves/config/cache untouched. Rollback receipt: `build/ps5x360-adaptation/rollback.json`.
+
+Restored all three affected SDK source files from pre-adaptation backups in both
+SDK trees, restored the prior exported patch and bounds-test expectations, and
+archived the dynamic-only test/script. Reverse-application check passes. Restored
+raw executable also replaces `build/native-title/eboot.bin`. Candidate receipt
+marked withdrawn and its deployment script now refuses reuse. Forza relaunch
+requested; no additional user test is required for this rollback.
+
+Rollback startup passed: still running after 30 seconds; fresh forza_030.log lacks the withdrawn memory counters. Exact source/patch/binary backup checks passed, Linux runtime rebuilt and copied into its run directory. Forza left running.
+
+## October 16 — three wait/scheduling candidates installed
+
+User explicitly requested trying the three newer fixes from the Pinyon Shift
+research. Added a 200 us delay only at the verified base-game render-idle
+SleepEx call (LR 0x8259FBEC); a lazy, condition-variable timer queue with
+interruptible deadlines; and a GPU-progress sequence/wakeup with a requested
+1 ms maximum wait after 20 us of unchanged guest fence progress. Original guest
+idle/fence functions always execute, retaining APC and timeout/kick behavior.
+GPU signals are wake hints after command-processor packet effects, not fabricated
+fence completions. The two withdrawn PS5X360 memory changes remain absent.
+
+Production timer/wakeup sanitizer tests passed (earlier deadlines, cancellation,
+self-disarm, 1600 concurrent publications, shutdown and wake races). Hook tests
+passed for exact-call filtering, disabled controls, progress wake and original
+results. Native runtime, private module and signed executable builds passed;
+module hooks and original functions are present. Exported SDK patch reverse check
+passed. These checks do not establish race performance.
+
+Installed matched executable `b8c46b26297ee1f1c1dea245e4f04b2e36c835d366b84ae54f4ec5ce5fdb19ed`
+and private module `faea58901d178f09a53d6c3b713496578a0cb124480363155547ce9158334ebe`.
+Staged/live/backup raw SHA256 verification passed for both. Previous pair retained
+on console with `.before-wait-fixes-20261016-103933` suffix and locally under
+`build/wait-fixes/before-*`. Saves, configuration and shader caches preserved.
+Receipts and checks: `build/wait-fixes/`. Startup verification underway; gameplay
+acceptance pending. Never publish the private module or generated game code.
+
+Startup check completed: running after 45 seconds, fresh forza_031.log confirms
+render-idle delay and GPU fence wake (first wait signalled). Startup frame gaps
+remain, including 166.8 ms; no claim of stutter elimination or improved race
+performance. Existing missing-file warnings also occurred in the previous build.
+Forza left running for the user’s final gameplay comparison.
+
+User reports remaining stutters with all three wait fixes. Captured live forza_031
+as build/console/wait-fixes-user-stutters-runtime.log; summary in
+build/wait-fixes/user-stutters.json. Latest roughly 60 seconds include 166.7 ms
+guest frame gaps, while pipeline waits total about 0.7–0.9 ms per five seconds.
+The wait fixes have not eliminated stalls. No causal before/after conclusion;
+no restart or changes made during this read-only follow-up.
+
+## October 16 — work stopped at explicit user request
+
+User requested documenting everything and stopping. Full handoff saved in
+STUTTER-HANDOFF.md: installed matched pair, active/withdrawn changes, tests,
+remaining stutters, uncertainty, evidence and rollback paths. No console action
+performed for this handoff; Forza left running. No further work until resumed.
+
+## October 16 — command-thread blocking isolated; sync-batch candidate prepared
+
+User resumed ("check and do something"); the earlier stop request is superseded.
+No console change has been made in this step: the deployment attempt aborted at
+its first process query because the console was disconnected, before any FTP
+transfer. Installed executable remains the wait-fixes build
+`b8c46b26297ee1f1c1dea245e4f04b2e36c835d366b84ae54f4ec5ce5fdb19ed` with module
+`faea58901d178f09a53d6c3b713496578a0cb124480363155547ce9158334ebe`.
+
+Re-analysis of the saved dispatch-stage traces (`dispatch-race-live-trace.bin`,
+`stutter-resume-trace.bin`, race-only sections, 2,734 and 8,318 command frames):
+
+| Frame wall time | Frames | Command-thread CPU / non-waiting wall | Blocked (wall − waits − CPU) |
+| --- | ---: | ---: | ---: |
+| under 40 ms | 2,640 / 8,198 | 0.84–0.86 | 2–3 ms |
+| 40–60 ms | 44 / 58 | 0.63 | 17 ms |
+| 60–80 ms | 34 / 40 | 0.58 | 25 ms |
+| 80 ms and over | 16 / 22 | 0.58 | 32 ms |
+
+The blocked time is not general preemption: dispatch, bindings, constants,
+samplers, targets and pipelines take 1.2–1.4x their normal-frame medians in long
+frames, while primitives take 29x, vertex buffers 12x, resolves 10x and textures
+4x. Blocked time correlates 0.98 with the sum of those four shared-memory stages
+and 0.45 with the other CPU stages. Those four stages are the paths that take the
+global critical region and change host page protection: RequestRanges uploads,
+MakeRangeValid (one acquisition for validity bits plus one per physical heap for
+protection, per upload chunk) and RangeWrittenByGpu. Guest write-watch faults hold
+the same mutex through a kernel protection query and an mprotect. This is the
+mechanism hypothesis; the per-frame counters below are what will confirm or
+refute it from normal play, without a diagnostic race.
+
+Candidate `build/sync-batch/eboot.bin`, SHA-256
+`b7c084f35836fbe804661a3c458751118c13cca8d645f5b82a3e0c9005e3b435`
+(module unchanged; no ABI or import change):
+
+- `SharedMemory::MakeRangesValid`: all chunks of one upload pool page are marked
+  valid and protected in a single acquisition, then copied. Pages are still
+  protected before they are copied. Chunk flushes happen whenever a pool page is
+  filled, because the next request closes and flushes that page (non-coherent
+  memory). The upload pool gained a `page_size()` accessor for this.
+- PS5 `QueryProtect` answers from the tracked arena view access (the state the
+  kernel accepted) without a kernel call; pages of unbacked units report no
+  access, as the kernel does. Removes one syscall per write-watch fault from
+  under the lock. Non-arena addresses still query the kernel.
+- Always-on five-second line `PS5 memory sync:` next to `PS5 frame timing`:
+  contended global-lock waits and wait time on the shared-memory paths, upload
+  ranges and megabytes, Protect calls, mprotect syscalls and time, protection
+  queries and kernel fallbacks, write-watch faults and handler time. TSC cycles
+  scaled by each window's measured rate.
+
+Verification: PS5 runtime, title link, layout check and signing passed. Linux
+build passed; 160 s headless smoke rendered the intro and scripted driving
+(car, road, landscape, HUD at 147 s; `build/sync-batch/shot_0147.48.png`), with
+PERF around 30 fps. Host tests: `test-memory.sh` (tracked queries cross-checked
+against `/proc/self/maps`, unbacked units, repeated-access no-syscall, kernel
+fallback counter), `test-shared-memory.sh` (batched validity exactness, gaps stay
+invalid, single-page re-upload, degenerate ranges, contended-lock counter),
+`test-shared-memory-bounds.sh`, `test-title-waits.sh` pass. `test-wait-primitives.sh`
+aborted once with a harness `std::future_error` and passed on three reruns; it
+does not compile the changed code. Source mirrored to `.deps/sdk-merge`, exported
+to `ps5/patches/rexglue-ps5.patch` (86 files), reverse-application check passed.
+Previous patch: `build/sync-batch/before-rexglue-ps5.patch`.
+
+Deployment: `build/sync-batch/deploy.py` replaces only `eboot.bin` after checking
+the live hash equals the wait-fixes build, keeps the previous file as
+`eboot.bin.before-sync-batch-<stamp>` and verifies staged, live and rollback
+hashes. Run it when the console is connected, then
+`python3 tools/console.py boot sync-batch --seconds 60` and read the
+`PS5 memory sync` lines. Nothing here is gameplay proof; no stutter claim.
+
+### sync-batch deployed and started (console reconnected)
+
+Installed `eboot.bin` SHA-256 `b7c084f35836fbe804661a3c458751118c13cca8d645f5b82a3e0c9005e3b435`;
+staged, live and rollback hashes verified. Previous executable retained as
+`eboot.bin.before-sync-batch-20261016-112009` (b8c46b26…). Module unchanged.
+Forza was not running at deployment (no progress at risk). Launched; still
+running after 60 s; `forza_032.log` saved as `build/console/sync-batch-runtime.log`,
+startup window counters in `build/sync-batch/startup-counters.json`.
+
+First five-second windows at the title/attract sequence (not gameplay):
+lock_waits 2,300–8,100 per window with 32–233 ms of command-thread lock wait;
+4,500–5,200 mprotect syscalls costing 210–245 ms (about 45 us each);
+1,230–1,505 write-watch faults costing 85–122 ms (about 85 us each, including the
+handler's unprotect); 85–115 MB uploaded in 2,300–3,100 ranges. Windows with
+4–9 guest gaps over 50 ms had 143–233 ms of lock wait; the window with none had
+32 ms. No kernel-side protection queries remain (query_syscalls=0).
+This supports the blocking mechanism; gameplay windows are still needed and
+come from the user's normal play. No stutter-fix claim.
+
+Likely next reduction, not yet built: a lock-free upload-range scan in
+RequestRanges (the valid-page fast path already reads the bits without the lock
+for the same reason), and merging protection changes across already-watched
+pages so a request costs one mprotect per heap instead of one per range.
+
+### Play-session counters and lock-relief candidate
+
+`forza_032.log` (`build/console/sync-batch-play-runtime.log`), 102 five-second
+windows of the user's play with the sync-batch build (user reports stutter
+continued, also when not saving):
+
+| | Clean windows (77) | Windows with gaps (25) |
+| --- | ---: | ---: |
+| Command-thread lock wait | 2.1 ms | 127.9 ms |
+| Contended acquisitions | 218 | 5,793 |
+| Upload MB | 251.5 | 129.0 |
+| Upload ranges | 1,400 | 2,803 |
+| mprotect syscalls | 3,450 | 4,678 |
+| Write-watch faults | 1,665 | 1,352 |
+
+Correlation with gap count: lock wait 0.74, upload MB -0.48, faults -0.35.
+The command thread's stalls are waits for the global critical region; upload
+volume and faults do not distinguish bad windows. Guest heap operations
+(BaseHeap Alloc/AllocRange/Decommit/Release/Protect and the PhysicalHeap
+wrappers) hold that region on PS5 for host-page reconciliation, issuing ~45 us
+mprotect calls inside it; a save overwrite also deletes the previous save
+directory inside it (DeleteContent), which matches the reported save lag.
+
+Candidate `build/lock-relief/eboot.bin`, SHA-256
+`389783fd873c200b1a976640528c27d6b98a8def20839a04dae1635f370ca7c7` (module
+unchanged): freed host pages stay read/write on all heaps (Windows-host
+behaviour; zero page unaffected), RequestRanges picks upload pages from atomic
+reads without the region, DeleteContent holds the region only for the
+open-package check, and the memory log gains heap_syncs/heap_sync_ms. PS5 and
+Linux builds pass; memory, shared-memory and bounds host tests pass; patch
+exported (86 files) and reverse-checked. Linux smoke in progress; the heap
+change is PS5-only (4 KiB guest vs 16 KiB host pages) and is not exercised on
+Linux. Not deployed yet; `build/lock-relief/deploy.py` expects the installed
+b7c084f3… build. No stutter-fix claim until the user plays with it.
+
+### lock-relief installed; holder attribution candidate
+
+lock-relief `389783fd…` installed 11:34 (user authorized closing Forza);
+rollback `eboot.bin.before-lock-relief-20261016-113427` (b7c084f3…). Running
+after 60 s. Play windows (`build/console/lock-relief-play-runtime.log`,
+`forza_033.log`): gap windows still wait ~147 ms per 5 s on the lock; new
+`heap_sync_ms` is only 0.4–2.2 ms per 5 s, so guest heap host-page
+reconciliation is NOT a significant holder and the freed-page change is not a
+fix (kept: harmless, matches Windows host behaviour). The user reports stutter
+continues and save lag continues. The save window had 8.2 ms lock wait and an
+82 ms gap: save lag is not lock contention. Saves run synchronously on guest
+thread t101826 (the thread that registered modules at boot; 38 content reads).
+
+Candidate `build/holder-trace/eboot.bin` adds, on top of lock-relief:
+- `global_critical_region::Acquire/AcquireDirect` record the caller's
+  `std::source_location`; the command thread's contended waits are attributed
+  to the last recorded site and logged every 5 s as
+  `PS5 lock holders behind waits: file:line=Nx/ms ...` (top 6). The direct
+  `mutex().lock()` in `ObjectTable::LookupObject` records too.
+- `Save content mount:` gains `close_delete_ms` and `create_open_ms`;
+  `Content write:` and `Content close:` lines report save file writes/closes
+  over 1 ms with the thread id.
+Patch exported (87 files), reverse-check passed. Deploy with
+`build/holder-trace/deploy.py` (expects installed 389783fd…) when Forza is closed.
+
+### holder attribution results and spin-vfs build (installed)
+
+holder-trace executable `9fc0467b…` initially refused to start ("Game module was
+built for a different app version"): `include/rex/thread/mutex.h` is an ABI
+header, so the source_location change altered the identity. User chose fix
+forward over rollback: module rebuilt (`748d87b54510e0fa7a65fc512e61de93a715190fa603d3699f067c569c244bdc`,
+backup `game/forza.module.before-holder-trace-20261016-114620`, previous
+faea5890…) and installed; game then ran. Receipts: `build/holder-trace/`.
+
+Attribution during the user's play (`build/console/holder-trace-play-runtime.log`,
+17 gap windows vs 9 clean): waits per window behind handle lookups
+(`object_table.cpp:280`) 66 ms vs 32; `cache.cpp:475` (texture
+MakeUpToDateAndWatch, i.e. an unrecorded acquirer after it) 23 vs 9;
+`entry.cpp:54` (VFS `Entry::GetChild`, 28–58 holds of ~0.85 ms each) 10 vs 0;
+`xmemory.cpp:2120` 9 vs 5; `shared_memory.cpp:716` (invalidation) 9 vs 4.
+Save mount steps measured 2.3 ms and 0.6 ms; no Content write/close over 1 ms
+was logged yet, so the save lag is still unattributed.
+
+spin-vfs `5f9db050ac0060c3e43f2bbf8c61340939222fd538f40654bbdecd32cbc8654f`
+installed 12:0x after the user closed the game; rollback
+`eboot.bin.before-spin-vfs-<stamp>` (9fc0467b…); module unchanged (no ABI header
+touched). Changes: command-thread shared-memory acquisitions spin up to ~250 us
+before blocking (`lock_spins`/`lock_sleeps` counters); the virtual filesystem
+uses its own recursive mutex (`src/filesystem/tree_mutex.h`) instead of the
+global critical region; dispatch loop records its site. Startup comparison over
+the same nine windows: 11 frames over 50 ms vs 49 and 49 for the two previous
+builds; lock wait 6–33 ms per window vs up to 242; all contended acquisitions
+resolved by spinning, zero sleeps. Startup is not gameplay; the user's play
+decides. Receipts: `build/spin-vfs/`; patch exported (95 files), reverse-check passed.
+
+### spin-vfs play results and long-frame logging candidate
+
+With spin-vfs installed (user playing): the one stutter window reported
+(console 08:01:21, 6 frames over 50 ms, max 200 ms) had 32.7 ms lock wait and
+zero lock sleeps, but 148 MB uploaded, 6,259 mprotect syscalls (282 ms) and
+1,527 write faults (122 ms) in five seconds. The 13 windows after it had 150
+swaps and no gap each, 5 ms lock wait. The remaining stall is therefore not the
+lock; the render thread's own work in streaming bursts (protection syscalls at
+~45 us each, copies, texture loads) is the next suspect, and needs per-frame
+attribution again. Save mount steps are 1.9 ms and 0.6 ms; no content write or
+close over 1 ms has been logged, so save lag is still unattributed.
+
+Candidate `build/longframe/eboot.bin` (module unchanged): the app's frame
+stage accounting is always on and every command frame over 45 ms is written to
+the runtime log as `PS5 long frame:` with total wall, thread CPU, the memory
+sync counter deltas for that frame (lock waits/sleeps, uploads, mprotects,
+faults) and the exclusive stage categories over 0.2 ms. Cost: one ordered
+cycle read per stage boundary on the command thread (the earlier
+dispatch-stage diagnostic builds carried the same). Kernel `NtCreateFile`
+logs opens over 2 ms as `Slow file open:` (save files, streaming). Patch
+exported (95 files), reverse-check passed. Not yet deployed.
+
+### longframe build installed; first per-frame attribution without lock noise
+
+longframe `09112d633b4734a024c1823819fa89a22a7f980e47eac443c7944d41c8f1e922`
+installed (Forza was not running); rollback `eboot.bin.before-longframe-<stamp>`
+(spin-vfs 5f9db050…). `PS5 long frame:` lines work (bug: counter deltas wrap
+when the five-second log resets the counters; fixed in the next build).
+
+Play session (`build/console/longframe-play-runtime.log`): 67 long frames.
+In the stutter burst (08:10:09–11) render-thread CPU per long frame is 24–51 ms
+(dispatch 6–9, textures 3–9, resolves 2–4, primitives+vertex buffers 2–8,
+protection syscalls 2–8 ms per frame) while 10–160 ms per frame is spent
+waiting for the game to submit commands (empty ring). Lock wait is under 1 ms
+per frame with zero sleeps. Faults 12–36 per frame. Interpretation: the game
+waits on the previous frame's GPU fence while the command thread needs more
+than a frame of CPU for busy scenes, so the two serialize; cutting render-thread
+CPU (protection syscalls, texture/upload work, dispatch) is the lever.
+
+Save: mount steps 2.3/0.6 ms; no file open over 2 ms, no content write/close
+over 1 ms. Six long frames 3 s after the save were the game being late (render
+CPU 7–12 ms, empty ring 31–66 ms). `kDeferredOverlappedDelayMillis` is 100 ms:
+each deferred overlapped completion (two per save) sleeps 100 ms before
+completing. savetrace build adds completion queue/run latency logging,
+`Profile settings write` timing (`XamUserWriteProfileSettings` writes one host
+file per title setting synchronously) and the counter fix. Not yet deployed.
+
+### savetrace installed
+
+`02f23bdd7c6fa928493ce7fd5051a7c8e96a82da09268b6f2e2dc48aa1b2777f` installed
+(game was closed); rollback `eboot.bin.before-savetrace-<stamp>` (longframe
+09112d63…); module unchanged. Running after 70 s; long-frame lines present
+(startup frames: CPU ~26 ms, empty ring 13–21 ms, register wait 5–13 ms,
+protection 2.6–3.2 ms, 15–21 faults). User gave standing permission to close
+Forza for deployments. Awaiting a play/save session for the deferred-completion
+and profile-settings timings.
+
+### savetrace session: save path measured; coarse-watch candidate
+
+savetrace play (`build/console/savetrace-play-runtime.log`): one save at
+08:17:46. Two deferred overlapped completions: run 100.2 ms and 100.1 ms (the
+fixed `kDeferredOverlappedDelayMillis = 100`), the second queued 67.4 ms behind
+the first; mount steps 1.8/0.6 ms; no profile-settings write, slow open, or
+content write/close logged. Fifteen long frames 3–5 s after the save had render
+CPU 7–25 ms and empty ring 31–141 ms (game late, light scene). 144 long frames
+total: median CPU 26.9 ms, empty ring 22.3, register wait 8.4, dispatch 6.9,
+textures 4.5, resolves 2.2, protection 2.9 ms (up to 8.1 with 183 mprotects),
+faults 16. Worst frames (150–167 ms) combine 39–48 ms render CPU with 98–124 ms
+empty ring: a long render frame leaves the game waiting on the GPU fence, then
+its catch-up makes the next frames late.
+
+Candidate coarse-watch (eboot + forza.toml): new cvar `shared_memory_page_log2`
+(0 = host page) set to 16 on PS5 so neighbouring small ranges share one 64 KiB
+protection change and one validity page; new cvar `deferred_overlapped_delay_ms`
+(default 100) set to 16. Nothing outside the shared-memory files depends on the
+page size (command processor derives from it). Patch exported (97 files),
+reverse-check passed. Live forza.toml matched git HEAD (449d374e…); rollback
+copies in `build/coarse-watch/before-*`. Build in progress.
+
+### Dynamic vertex content tracking reinstated (user instruction)
+
+User asked to use the Xenia/PS5X360 approaches to move faster. PS5X360 v0.5.6
+lists exactly: fast-path for valid GPU memory (present), mutexes that spin
+before blocking (done today for the command thread) and content comparison for
+repeatedly rewritten vertex data (the change withdrawn on October 16 before the
+lock problem was found). Xenia uses the same write-watch design. Reinstated the
+content-check part only, on 16 KiB pages (no 4 KiB upload units), merged onto
+today's code: pages that take three write faults become dynamic, stay invalid
+and unprotected, and each draw compares an XXH3 hash of their contents against
+the last upload; texture/index/watch/GPU-written users pin pages to normal
+tracking; `shared_memory_dynamic_vertices=false` now also stops pages from
+becoming dynamic (kill switch); duplicate pages within one batch are hashed
+once. Header changed (ABI): module rebuilt as a matched pair.
+
+Tests: `test-dynamic-vertex-memory.sh` (adapted to 16 KiB pages, with a
+changed-content upload check), `test-shared-memory.sh`, and
+`test-shared-memory-bounds.sh` (dynamic tracking disabled for its widening
+checks) pass under UBSan. Linux compile passed; Linux smoke in progress. Patch
+exported, reverse-check passed. Rollback pair: eboot 1f763494… (coarse-watch),
+module 748d87b5…. Deploy via `build/dynamic-vertices/deploy.py`.
+
+### dynamic-vertices installed
+
+`3e02fa081573cabc2d33d4745d8587ea009701b737e38f4c8696e4b14891d9bc` installed
+(Forza closed under the user's standing permission); rollback
+`eboot.bin.before-dynamic-vertices-<stamp>` (coarse-watch 1f763494…); module
+unchanged (identical rebuild; the game module includes no graphics headers).
+Linux smoke: 160 s, driving frame correct at 147 s. Startup: 204 dynamic
+pages; about 635 MB per 5 s of unchanged dynamic data skipped (hashed instead),
+57 MB per 5 s uploaded. Title-screen protection syscalls and faults did not
+fall (streaming of new data dominates there); startup long frames 29 vs 35/50
+for the two previous builds (same loading pattern). Hashing happens per draw,
+not per frame; a per-frame hash memo is a possible follow-up if the
+`vertex_buffers` stage grows. Gameplay verdict pending from the user's play.
+
+### dynamic-vertices play result: no gain; switched off in config
+
+User played (`build/console/dynamic-vertices-play-runtime.log`, 60 windows, 17
+with gaps, 86 gaps) and reports stutters. Busy long frames (render CPU >= 20 ms)
+compared with the three previous sessions: mprotects 79 vs 66–78, faults 19 vs
+17–21, render CPU 29.9 vs 27.3 ms, vertex_buffers stage 3.7 vs 1.6 ms (per-draw
+hashing), uploads 1.5 MB vs 1.4–1.7. 28.9 GB "skipped" were re-requests the
+in-sync shortcut had already avoided before. Protection syscalls therefore come
+from newly streamed data, not rewritten buffers; the content check does not
+address them and costs about 2 ms per busy frame. PS5X360 0.5.7 likewise made
+these speed-ups off by default. Set `shared_memory_dynamic_vertices = false`
+in forza.toml (code retained); worst frames remain 35–53 ms render CPU plus
+75–140 ms waiting for the game. Remaining levers: command dispatch (~7 ms),
+textures (5–9 ms), protection syscalls for streamed data (3–7 ms), and the
+game's fence-wait serialization; all need a render-thread CPU profile next.
+
+
+---
+
+## Archived handoff (formerly STUTTER-HANDOFF.md, superseded by the sections above)
+
+# Forza stutter work — resumed 2026-10-16; sync-batch build installed and running
+
+The user resumed ("check and do something") and then reported the console was
+disconnected and asked to wait. The console then reconnected and the sync-batch
+executable b7c084f35836fbe804661a3c458751118c13cca8d645f5b82a3e0c9005e3b435 was
+installed (module unchanged); the "Current installed state" executable hash below
+is superseded, rollback `eboot.bin.before-sync-batch-20261016-112009`.
+See STATUS.md "command-thread blocking isolated" for the analysis and the
+candidate `build/sync-batch/eboot.bin` (b7c084f35836fbe804661a3c458751118c13cca8d645f5b82a3e0c9005e3b435).
+Next step when connected: `python3 build/sync-batch/deploy.py`, then
+`python3 tools/console.py boot sync-batch --seconds 60`, then read the
+`PS5 memory sync` log lines during the user's normal play.
+
+## Current installed state
+
+Title PPSA99690 on PS5 192.168.50.6, /mnt/ext1/etaHEN/games/PPSA99690.
+Executable SHA256: b8c46b26297ee1f1c1dea245e4f04b2e36c835d366b84ae54f4ec5ce5fdb19ed
+Private module SHA256: faea58901d178f09a53d6c3b713496578a0cb124480363155547ce9158334ebe
+Both must be updated/restored as a matched pair because runtime imports/ABI changed.
+Never publish the private module or generated game code.
+
+Active changes:
+- Render-idle SleepEx call at LR 0x8259FBEC gets a targeted 200 us sleep;
+  original guest function still executes. Control: forza_render_idle_sleep_us (0 disables).
+- Timer queue is lazy and uses condition-variable waits; earlier queued deadlines
+  interrupt its sleep. Original cancellation and recurring-timer behavior retained.
+- Guest fence predicate sub_829F04A8 waits for GPU progress after 20 us unchanged
+  progress, with a requested 1 ms timeout; original predicate/timeout/kick logic
+  always executes. Control: forza_block_on_gpu_fence. Wake signals are hints,
+  not fabricated GPU completion. Scheduler delays may exceed requested timeout.
+
+The withdrawn PS5X360 4 KiB upload-unit and dynamic vertex hashing changes remain
+reverted. Earlier bounded-invalidation work remains present. Do not reintroduce
+withdrawn changes without a new user instruction.
+
+## Verification and result
+
+Native runtime, private module and signed executable builds passed. SDK patch
+reverse-application check passed. Timer/GPU wake sanitizer tests cover earlier
+deadlines, cancellation, self-disarm, 1600 concurrent publications, shutdown,
+pre-wait signals and racing/broadcast wakeups. Hook checks cover call filtering,
+disabled controls, bounded requested wait and preservation of original results.
+Staged/live/rollback raw SHA256 checks passed for both installed files.
+Forza remained running after 45 seconds. Fresh forza_031.log confirmed render-idle
+hook and GPU fence wakeups. No claim of gameplay success follows from build/startup.
+
+User reports a few stutters remain. Latest captured 60.10 seconds: 28.97 swaps/s,
+44 frame gaps over 50 ms, largest gap 166.7 ms; slowest five-second window 24.70
+swaps/s. Pipeline waits total about 0.7–0.9 ms per five-second window, too small
+to explain the large gaps. These counters do not isolate the remaining cause.
+There is no controlled equivalent-scene before/after comparison establishing
+benefit or regression. The three changes are not accepted as a stutter fix.
+Missing-file warnings (including AMB_Red_Rock.fsb) also occurred before this build;
+no causal relationship to stalls has been established.
+
+User is tired of repeated tests and requested only one final manual race.
+Do not ask for another repetitive diagnostic race by default. Research and local
+checks should precede any future proposed console changes when work resumes.
+
+## Evidence and rollback
+
+- STATUS.md contains chronological work/results and earlier candidate history.
+- build/wait-fixes/candidate.json, deployment.json, deployment.log, startup.log.
+- build/wait-fixes/user-stutters.json and tests/build logs in that directory.
+- build/console/wait-fixes-user-stutters-runtime.log (forza_031.log).
+- build/console/wait-fixes-before-runtime.log, wait-fixes-runtime.log and klog.
+- build/wait-fixes/before-eboot.bin and before-forza.module: previous matched pair.
+- build/wait-fixes/before/: source/ABI/patch backups, backed-up-files.json.
+- build/ps5x360-adaptation/rollback.json: earlier user-requested memory rollback.
+- ../updates-20261016/internet-stutter-research/: pinned upstream research/findings.
+
+Previous executable SHA256: 7903b4e82b0ea6b2d72223c6fd9760d1dc3565ca38780caa9b34d3779d7026ee
+Previous module SHA256: 7ce1604a0df368856ab3b87f7d468cb332ee9c2047d1b5b236f94ede34c47d17
+Console rollback paths:
+- /mnt/ext1/etaHEN/games/PPSA99690/eboot.bin.before-wait-fixes-20261016-103933
+- /mnt/ext1/etaHEN/games/PPSA99690/game/forza.module.before-wait-fixes-20261016-103933
+
+Restore only after closing Forza and verifying the matched pair, if later requested.
+Saves, config, game assets and shader caches were preserved throughout deployment.
+Current work is local/uncommitted; preserve unrelated pre-existing changes.
+Implementation: ps5/module/title_waits.cpp, ps5/tools/build-game-module.py,
+ps5/module ABI/import lists, SDK timer_queue.cpp, gpu_write_signal.{h,cpp},
+command_processor.cpp and system/CMakeLists.txt. SDK changes mirrored into
+.deps/sdk-merge and exported in ps5/patches/rexglue-ps5.patch. Focused tests:
+ps5/tests/{wait_primitives,title_waits}.cpp and matching ps5/tools/test-*.sh.
+
+Stopped. No additional work is pending authorization within this active turn.

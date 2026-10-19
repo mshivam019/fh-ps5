@@ -1,0 +1,41 @@
+{
+  "PPSA99680": {
+    "name": "Naruto: Rise of a Ninja",
+    "module": "naruto.module",
+    "abi_symbol": "naruto_module_abi",
+    "exports": [
+      "naruto_module_abi",
+      "PPCImageConfig",
+      "NarutoAI2C_Register",
+      "NarutoAI2C_GetImageInfo"
+    ],
+    "abi": "a6ccbe49da810be7cbf69cd71ecaeaf07e5911fb5e181b2a33db993ef51dc9ab",
+    "app_release": "v0.1.0",
+    "guest_sha256": {
+      "default.xex": "f8fd8a979fb5451460f820303a6ca4c75e01fd943aed600983cb68fc491af7bd",
+      "ai2c.dll": "ed760975544e9aff2f603c284f62011d712e1fa408d0edbf7528fa534e9a0d3d"
+    },
+    "app_sha256": "420e7dbbe573f1ee8a452aae5d53363e80622cbbd530f6cc531f8fd58c5b57de"
+  },
+  "PPSA99690": {
+    "name": "Forza Horizon",
+    "module": "forza.module",
+    "abi_symbol": "forza_module_abi",
+    "exports": [
+      "forza_module_abi",
+      "PPCImageConfig",
+      "ForzaXMF_Register",
+      "ForzaXMF_GetImageInfo",
+      "ForzaSF_Register",
+      "ForzaSF_GetImageInfo"
+    ],
+    "abi": "ef11baf73b2614621a10bb6902ca069403b86428cdf58e9c38c80c22018c72dc",
+    "app_release": "v0.1.0",
+    "guest_sha256": {
+      "default.xex": "db40df605ade49a612b35a7a24c38f6004bcb17a88ed6b48288de16df9e3987c",
+      "xmediafacade_default.xex": "ed285beefeafcdc90cf64d6085d19c874e3f1e15072c12cdf9ba2237c88e2ce5",
+      "speechfacade_default.xex": "d54f6aae6ae2fd6da9b8c37d48f0a6bb295caa18ad82d0d9df66026141a41594"
+    },
+    "app_sha256": "bf7a02bc0cb4f2371106a359fc90493ad607c20362f41a9fa09b775ca52ee2c8"
+  }
+}

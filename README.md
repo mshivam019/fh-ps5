@@ -10,7 +10,7 @@ your own **Forza Horizon** Xbox 360 disc 1 image (USA release). Game files,
 generated game code and saves are not distributed with this project.
 
 [Releases](https://github.com/mshivam019/fh-ps5/releases) ·
-[Install](ps5/SETUP.md) · [Build from source](ps5/BUILD.md)
+[Install](INSTALL.md) · [Build from source](ps5/BUILD.md)
 
 ## State
 
@@ -23,8 +23,8 @@ generated game code and saves are not distributed with this project.
   hitching were removed; what remains is ordinary CPU work. Measurements and
   the next steps are on the development branch (below).
 - PlayStation button prompts are built in but not yet verified on a console.
-- Setup for players has not completed an end-to-end test yet; see
-  [`ps5/SETUP.md`](ps5/SETUP.md).
+- ISO-to-module setup has passed a local end-to-end run. The updated desktop
+  packaging adds repeatable folder checks; see [INSTALL.md](INSTALL.md).
 
 Development notes, measurements and the ongoing render-thread optimization live
 on the [`optimize-render-thread`](https://github.com/mshivam019/fh-ps5/tree/optimize-render-thread)
@@ -32,13 +32,15 @@ branch (`STATUS.md`, `PLAN.md`).
 
 ## Install
 
-1. Install **PPSA99690.zip** with your native-title launcher or PS5 Upload.
-2. On a Linux computer (Windows: WSL2), extract the matching setup ZIP and run
-   `sh setup.sh --iso "/path/to/Forza Horizon (USA).iso"`.
-3. Copy the `game` folder setup creates into `/mnt/ext1/etaHEN/games/PPSA99690/`.
-4. Launch **Forza Horizon** from the home screen.
+Use the matching app ZIP and **setup v1.2.0** from the private v0.1.0 release.
+Run `sh setup.sh` to choose an ISO and output folder (Linux or Windows WSL2).
+Already have a prepared game folder? Run `Prepare-Game-Files-Windows.cmd` or
+`sh prepare-game-files.sh` to reuse it without compiling.
 
-[`ps5/SETUP.md`](ps5/SETUP.md) has the requirements, layout and controls.
+The result is a checked `PPSA99690` folder you can copy using any method.
+Validation and optional FTP transfer are separate commands. No M.2 drive,
+PS5 Upload or wired connection is required. See [INSTALL.md](INSTALL.md)
+for the full-folder option, requirements and save-preserving update instructions.
 
 ## How it works
 

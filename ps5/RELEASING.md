@@ -50,3 +50,13 @@ fork of the catalog as `apps/PPSA99690.json`:
 Check it with `python3 -m catalog check` and `python3 -m catalog verify PPSA99690`
 in the catalog checkout, then open the pull request from the repository owner's
 account, changing only that record.
+
+## Desktop-only setup updates
+
+When the runtime, generated-code inputs and module ABI are unchanged, publish
+a new versioned setup ZIP and its own `.sha256` as additive assets on the matching
+app release. Record the setup source commit in the release notes. Never replace
+existing assets or change the app tag/contentVersion for a desktop-only update.
+Run the helper tests, verify the source ZIP inventory and read back published
+assets. State which real game inputs were checked. Keep this repository and
+its releases private; publishing a catalog entry requires a separate decision.

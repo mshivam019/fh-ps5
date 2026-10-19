@@ -19,6 +19,8 @@ import tomllib
 import urllib.request
 import zipfile
 
+from ps5_x360 import finish_setup, interactive_build
+
 ROOT = Path(__file__).resolve().parents[2]
 PINS = json.loads((ROOT / 'sources.json').read_text())
 TOOLS = json.loads((ROOT / 'ps5/module/toolchain.json').read_text())
@@ -167,20 +169,9 @@ def prepare_toolchain():
     return compiler, sysroot
 
 
-def package(game, module, output):
-    step('Writing the game folder...')
-    destination = output / 'game'
-    destination.mkdir(parents=True)
-    for path in sorted(game.rglob('*')):
-        relative = path.relative_to(game)
-        if relative.parts[0].casefold() == '$systemupdate':
-            continue
-        target = destination / relative
-        if path.is_dir():
-            target.mkdir(exist_ok=True)
-        else:
-            shutil.copy2(path, target)
-    shutil.copy2(module, destination / 'forza.module')
+def package(game, module, output, app=None):
+    step('Writing and checking the ready-to-copy folder...')
+    finish_setup('PPSA99690', game, module, output, app)
 
 
 def main():
@@ -191,7 +182,14 @@ def main():
     parser.add_argument('--output', type=Path, default=ROOT.parent / 'Forza-PS5-prepared/PPSA99690',
                         help='New folder to write (ends in PPSA99690)')
     parser.add_argument('--jobs', type=int, default=max(1, min(8, os.cpu_count() or 1)))
-    args = parser.parse_args()
+    parser.add_argument('--app', type=Path, help='Optional matching app ZIP/folder for a complete title; omit if app is already installed')
+    argv = None
+    if len(sys.argv) == 1:
+        argv = interactive_build('PPSA99690')
+        if argv is None:
+            print('Cancelled. No build started.')
+            return
+    args = parser.parse_args(argv)
     if platform.system() != 'Linux' or platform.machine().lower() not in ('x86_64', 'amd64'):
         parser.error('Setup runs on Linux x86-64; on Windows, run it inside WSL2')
     if sys.version_info < (3, 11):
@@ -209,6 +207,14 @@ def main():
         parser.error('--output must end in PPSA99690')
     if args.output.exists():
         parser.error(f'Output already exists: {args.output}; choose a new folder')
+    if args.game and args.game.is_symlink():
+        parser.error('Choose real extracted files, not a symbolic link')
+    if args.game and (args.game.resolve() == args.output.resolve() or args.game.resolve() in args.output.resolve().parents):
+        parser.error('Choose an output folder outside the game input')
+    if args.app and args.app.is_dir() and (args.app.resolve() == args.output.resolve() or args.app.resolve() in args.output.resolve().parents):
+        parser.error('Choose an output folder outside the app input')
+    if args.app and (not args.app.exists() or args.app.is_symlink()):
+        parser.error('--app must be a real matching app ZIP or folder')
 
     source, sdk = fetch_sources()
     tool = build_codegen_tool(sdk, args.jobs)
@@ -220,10 +226,8 @@ def main():
     run(sys.executable, ROOT / 'ps5/tools/build-game-module.py', '--generated', generated,
         '--toolchain', compiler, '--sysroot', sysroot, '--sdk', sdk,
         '--work', BUILD / 'module', '--output', module, '--jobs', args.jobs)
-    package(game, module, args.output)
-    print(f'\nReady: {args.output.resolve()}\n'
-          'Copy its game folder into the installed app: /mnt/ext1/etaHEN/games/PPSA99690/game\n'
-          'It contains your game data and code generated from it. Do not share it.')
+    package(game, module, args.output, args.app)
+    print(f'\nReady: {args.output.resolve()}\nNo console was contacted. See INSTALL.md for manual copying or optional FTP.')
 
 
 if __name__ == '__main__':

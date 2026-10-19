@@ -3,7 +3,7 @@
 
 Extracts the disc image, generates and compiles the game code into the private
 game module, and writes a PPSA99690/game folder to copy into the installed app.
-Linux x86-64 (Windows: run it inside WSL2). The output contains your game data
+Linux x86-64 or native Windows x64 (Python 3.11+ and Git). The output contains your game data
 and code generated from it: never share it."""
 import argparse
 import hashlib
@@ -20,6 +20,7 @@ import urllib.request
 import zipfile
 
 from ps5_x360 import finish_setup, interactive_build
+from native_setup import windows_tools, unpack_zip, fetch_forza, check_windows_runtime
 
 ROOT = Path(__file__).resolve().parents[2]
 PINS = json.loads((ROOT / 'sources.json').read_text())
@@ -58,22 +59,13 @@ def find_file(directory, name):
 
 
 def fetch_sources():
-    """Pinned public sources: the Forza Horizon PC port (codegen configuration and
-    hooks) and the ReXGlue SDK with its patches and the PS5 patch (tools/prepare-sdk.sh)."""
-    step('Preparing the pinned Forza Horizon PC port and ReXGlue SDK source...')
-    run('bash', ROOT / 'tools/prepare-sdk.sh')
-    source = ROOT / 'upstream/forza'
-    actual = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
-    if actual != PINS['forza']['revision']:
-        raise ValueError(f'upstream/forza is at {actual}, expected {PINS["forza"]["revision"]}')
-    sdk = ROOT / '.deps/rexglue-sdk'
-    if subprocess.check_output(['git', '-C', str(sdk), 'rev-parse', 'HEAD'],
-                               text=True).strip() != PINS['rexglue_sdk']['revision']:
-        raise ValueError('Unexpected ReXGlue SDK revision')
-    return source, sdk
+    step('Preparing pinned sources and SDK patches...')
+    return fetch_forza(ROOT, PINS, run)
 
 
 def build_codegen_tool(sdk, jobs):
+    if platform.system() == 'Windows':
+        return windows_tools(ROOT, BUILD / 'windows-tools', download)[0]
     tool = BUILD / 'host/rexglue'
     if tool.is_file():
         return tool
@@ -119,7 +111,7 @@ def prepare_game(args):
 def generate_code(source, tool, game):
     generated = BUILD / 'codegen/generated'
     receipt = BUILD / 'codegen/receipt.json'
-    identity = {'tool': sha(tool), 'files': GAME_FILES, 'forza': PINS['forza']['revision']}
+    identity = {'compat': sha(ROOT / 'ps5/tools/codegen_compat.py'), 'tool': sha(tool), 'files': GAME_FILES, 'forza': PINS['forza']['revision']}
     if generated.is_dir() and receipt.is_file() and json.loads(receipt.read_text()) == identity:
         return generated
     step('Generating code from your game files...')
@@ -138,6 +130,9 @@ def generate_code(source, tool, game):
     shutil.copytree(recomp / 'hints', work / 'hints')
     (work / 'forza_manifest.toml').write_text(manifest)
     run(tool, 'codegen', work / 'forza_manifest.toml', cwd=work)
+    if platform.system() == 'Windows':
+        from codegen_compat import normalize
+        step(f'Preserved Forza dot-product fix at {normalize(generated)} instructions.')
     receipt.write_text(json.dumps(identity))
     return generated
 
@@ -159,13 +154,14 @@ def prepare_toolchain():
     cache = BUILD / 'tools'
     cache.mkdir(parents=True, exist_ok=True)
     compiler = cache / TOOLS['compiler']['directory'] / 'bin'
-    if not (compiler / 'clang++').is_file():
+    if platform.system() == 'Windows':
+        compiler = windows_tools(ROOT, BUILD / 'windows-tools', download)[1]
+    elif not (compiler / 'clang++').is_file():
         with tarfile.open(download(TOOLS['compiler'], cache)) as archive:
             archive.extractall(cache, filter='data')
     sysroot = cache / TOOLS['sysroot']['directory']
     if not (sysroot / 'target/include/c++/v1').is_dir():
-        with zipfile.ZipFile(download(TOOLS['sysroot'], cache)) as archive:
-            archive.extractall(cache)
+        unpack_zip(download(TOOLS['sysroot'], cache), cache)
     return compiler, sysroot
 
 
@@ -190,13 +186,18 @@ def main():
             print('Cancelled. No build started.')
             return
     args = parser.parse_args(argv)
-    if platform.system() != 'Linux' or platform.machine().lower() not in ('x86_64', 'amd64'):
-        parser.error('Setup runs on Linux x86-64; on Windows, run it inside WSL2')
+    if platform.system() not in ('Linux', 'Windows') or platform.machine().lower() not in ('x86_64', 'amd64'):
+        parser.error('ISO setup supports Linux x86-64 and native Windows x64')
     if sys.version_info < (3, 11):
         parser.error('Python 3.11 or newer is required')
-    for command in ('git', 'cmake', 'ninja', 'clang', 'clang++'):
+    if sys.maxsize < 2**32:
+        parser.error('Install 64-bit Python to run the native x64 tools')
+    commands = ('git',) if platform.system() == 'Windows' else ('git', 'cmake', 'ninja', 'clang', 'clang++')
+    for command in commands:
         if not shutil.which(command):
             parser.error(f'Missing required command: {command}')
+    if platform.system() == 'Windows':
+        check_windows_runtime()
     if args.jobs < 1:
         parser.error('--jobs must be positive')
     if args.iso and not args.iso.is_file():

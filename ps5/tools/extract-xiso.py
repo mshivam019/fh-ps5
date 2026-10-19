@@ -38,7 +38,9 @@ def read_directory(image, partition, sector, size):
         if left == 0xFFFF and right == 0xFFFF:
             continue  # sector padding
         name = table[offset + 14:offset + 14 + name_length].decode('ascii', 'strict')
-        if not name or '/' in name or '\\' in name or name in ('.', '..'):
+        reserved = {'CON', 'PRN', 'AUX', 'NUL', *('COM' + str(i) for i in range(1, 10)), *('LPT' + str(i) for i in range(1, 10))}
+        if (not name or any(c in name for c in '/\\:<>"|?*') or any(ord(c) < 32 for c in name) or
+                name.rstrip(' .') != name or name.split('.')[0].upper() in reserved or name in ('.', '..')):
             raise ValueError(f'Invalid file name in disc image: {name!r}')
         yield name, start, length, bool(attributes & 0x10)
         for child in (left, right):

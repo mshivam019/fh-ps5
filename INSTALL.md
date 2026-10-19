@@ -1,6 +1,6 @@
 # Installing Forza Horizon
 
-Use `PPSA99690.zip` and the newer `Forza-PS5-v0.1.0-setup-v1.2.0-linux.zip`
+Use `PPSA99690.zip` and the newer `Forza-PS5-v0.1.0-setup-v1.3.0.zip`
 from the private v0.1.0 release. The setup update changes desktop preparation only;
 the app and its module interface are unchanged. This repository remains private.
 
@@ -10,26 +10,38 @@ Your PS5 still needs a working native folder-title loader and title registration
 
 ## Start with an ISO
 
-Extract the setup ZIP. On Linux x86-64 or Windows WSL2, install Python 3.11+,
-Git, CMake, Ninja and Clang (Ubuntu: `sudo apt install python3 git cmake ninja-build clang`).
-Allow at least 20 GB of free space and internet access for the initial tool/source downloads.
-Run:
+Extract the setup ZIP and allow at least 20 GB of free space. Initial setup
+needs internet access to download pinned sources and tools.
 
-```sh
-sh setup.sh
-```
+**Windows x64:** install [64-bit Python 3.11+](https://www.python.org/downloads/windows/)
+and [Git for Windows](https://git-scm.com/downloads/win), then double-click
+`Setup-Windows.cmd`. Choose your ISO and output location. No Linux, WSL2,
+Visual Studio, CMake or manually installed compiler is needed. Python downloads
+and verifies the native Windows code generator and compiler automatically.
+The tools also need Microsoft’s [Visual C++ Redistributable x64](https://aka.ms/vc14/vc_redist.x64.exe),
+which many PCs already have. Setup checks for it and gives the download link if missing.
+This is the small runtime package, not Visual Studio.
+Use a short setup path such as `C:\PS5-Setup` to avoid Windows path-length limits.
 
-Choose your ISO and output location. A native file picker is used when available;
-a terminal prompt is the fallback. Setup extracts the disc, checks the supported
-executables, compiles the private game module, copies the finished files and
-verifies their SHA-256 hashes and module interface. It never contacts your console.
-This compilation still requires Linux/WSL2; native Windows/macOS ISO builds are not supported.
+**Linux x86-64:** install Python 3.11+, Git, CMake, Ninja and Clang (Ubuntu:
+`sudo apt install python3 git cmake ninja-build clang`), then run `sh setup.sh`.
+The existing Linux build remains supported. Native macOS ISO compilation is not
+implemented; macOS can still reuse and validate an already prepared game folder.
+
+A native file picker is used when available, with a terminal fallback. Setup
+extracts the disc in Python, checks the supported executables, compiles the
+private game module and verifies the finished copy. It never contacts your console.
+Python handles setup, but native compilation is still necessary; a pure Python
+replacement for the C++ compiler is not used.
 
 For a **complete app-and-game folder**, select the app ZIP on the command line:
 
 ```sh
 sh setup.sh --iso "/path/to/game.iso" --app "/path/to/PPSA99690.zip" --output "/path/to/Ready/PPSA99690"
 ```
+
+On Windows use `Setup-Windows.cmd` instead of `sh setup.sh` with the same arguments
+(or `py -3 ps5/tools/setup.py`).
 
 Without `--app`, the result contains only `game/`: merge it into the matching
 installed app. `--game /path/to/extracted-disc` can replace `--iso`; it still builds
@@ -114,7 +126,13 @@ For compiler failures, retain `build/setup/setup.log`. For controls and runtime
 settings see [SETUP.md](ps5/SETUP.md). Developer checks are documented in
 [the helper tests](ps5/tools/tests/README.md).
 
-## Validation of setup v1.2.0
+## Validation of setup v1.3.0
 
-Both ports passed 32 automated helper tests on Linux. The updated packaging also passed with the existing real Forza game module and disc files: 2,432 app/game files, 7,383,740,126 bytes, checked against the generated SHA-256 inventory. The unchanged ISO-to-module compiler path had passed a prior clean setup run.
-Native Windows/macOS picker execution and a new console installation were not tested for this desktop-only update.
+The Windows code generator and compiler are exercised under Wine on Linux with
+real private game inputs. This is not a physical Windows-machine test. File picker
+execution on native Windows/macOS and a fresh console installation remain untested.
+
+The existing full Forza app/game folder passed verification: 2,432 files, 7,383,740,126 bytes. After preserving the upstream dot-product overflow fix, Windows-generated code matches the patched Linux build across 86,832 guest function bodies.
+The app executable and module ABI are unchanged. Generated files are private and are not included in downloads.
+
+All 40 automated tests pass. Native Windows ISO extraction, code generation, compilation and folder packaging passed under Wine. The resulting full folder verified 2,432 files (7,383,735,350 bytes). This is build/packaging evidence, not a fresh console gameplay test.

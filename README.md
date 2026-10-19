@@ -32,8 +32,10 @@ branch (`STATUS.md`, `PLAN.md`).
 
 ## Install
 
-Use the matching app ZIP and **setup v1.2.0** from the private v0.1.0 release.
-Run `sh setup.sh` to choose an ISO and output folder (Linux or Windows WSL2).
+Use the matching app ZIP and **setup v1.3.0** from the private v0.1.0 release.
+On Windows x64, install Python 3.11+ and Git, then run `Setup-Windows.cmd`.
+It downloads the native tools automatically; WSL2 is unnecessary. On Linux, run
+`sh setup.sh`. Choose your ISO and output folder.
 Already have a prepared game folder? Run `Prepare-Game-Files-Windows.cmd` or
 `sh prepare-game-files.sh` to reuse it without compiling.
 

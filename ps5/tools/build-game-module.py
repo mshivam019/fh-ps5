@@ -8,6 +8,7 @@ import importlib.util
 from pathlib import Path
 import subprocess
 import sys
+from native_setup import executable, response_file
 
 ROOT = Path(__file__).resolve().parents[2]
 UPSTREAM = ROOT / 'upstream/forza/forza-recomp'
@@ -74,10 +75,7 @@ def main():
                         help='Developer mode: record the module imports as the app contract')
     args = parser.parse_args()
     support = load_support()
-    tools = {name: args.toolchain / name for name in ('clang++', 'ld.lld', 'llvm-nm')}
-    for name, path in tools.items():
-        if not path.is_file():
-            parser.error(f'Missing {name} in {args.toolchain}')
+    tools = {name: executable(args.toolchain, name) for name in ('clang++', 'ld.lld', 'llvm-nm')}
     args.work.mkdir(parents=True, exist_ok=True)
     log = args.work / 'build.log'
 
@@ -146,9 +144,10 @@ def main():
         abi_object = args.work / 'module_abi.o'
         run([clang, *flags, '-c', abi_source, '-o', abi_object], log)
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        run([tools['ld.lld'], '-shared', '-z', 'max-page-size=16384', '-z', 'common-page-size=16384',
+        link_args = ['-shared', '-z', 'max-page-size=16384', '-z', 'common-page-size=16384',
              '--hash-style=sysv', f'--version-script={version_script}', *objects, abi_object,
-             '-o', args.output], log)
+             '-o', args.output]
+        run([tools['ld.lld'], '--rsp-quoting=posix', response_file(args.work / 'link.rsp', link_args)], log)
 
     if args.write_imports:
         # Record the SDK headers the module compiles against; the ABI identity

@@ -1,0 +1,12 @@
+{
+  "codegen": {
+    "url": "https://github.com/rexglue/rexglue-sdk/releases/download/nightly-20261002-bd833a2a/rexglue-sdk-0.10.0.24-dev.gbd833a2-win-amd64.zip",
+    "sha256": "1e19d7ec9be0d9d7e1a0088a34a33b068d4dea520181e81318528ef3b37627e7",
+    "directory": "win-amd64"
+  },
+  "compiler": {
+    "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-x86_64.zip",
+    "sha256": "e3ad77d117a4bea19a7a3b333341824d79a5a371004a10e25b8504e7b3047666",
+    "directory": "llvm-mingw-20260922-ucrt-x86_64"
+  }
+}

@@ -1,7 +1,7 @@
 # Forza Horizon: controls and settings
 
 See [INSTALL.md](../INSTALL.md) for current setup, manual copying, optional FTP
-and validation instructions. The setup v1.2.0 update keeps the v0.1.0 app unchanged.
+and validation instructions. The setup v1.3.0 update keeps the v0.1.0 app unchanged.
 
 ## Controls
 
